@@ -10,6 +10,10 @@ __pycache__/
 *.pyc
 .pytest_cache/
 
+# direnv
+.direnv/
+.envrc
+
 # Build artifacts
 dist/
 build/

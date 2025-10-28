@@ -55,6 +55,13 @@ line-length = 88
 [tool.hatch.build.targets.wheel]
 packages = ["src/athena_polars"]
 
+[tool.hatch.build.targets.sdist]
+exclude = [
+    ".direnv/",
+    ".envrc",
+    "venv/",
+]
+
 [tool.mypy]
 python_version = "3.8"
 warn_return_any = true
