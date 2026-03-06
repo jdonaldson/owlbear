@@ -80,7 +80,7 @@ class TestTrinoExecuteQuery:
         ]
 
         with patch.object(trino_client, "_get_connection", return_value=mock_connection):
-            df = trino_client.execute_query("SELECT id, name FROM users")
+            df = trino_client.query("SELECT id, name FROM users")
 
         assert isinstance(df, pl.DataFrame)
         assert df.columns == ["id", "name"]
@@ -103,7 +103,7 @@ class TestTrinoExecuteQuery:
         ]
 
         with patch.object(trino_client, "_get_connection", return_value=mock_connection):
-            df = trino_client.execute_query("SELECT count, ratio, active FROM stats")
+            df = trino_client.query("SELECT count, ratio, active FROM stats")
 
         assert df.dtypes[0] == pl.Int64
         assert df.dtypes[1] == pl.Float64
@@ -120,7 +120,7 @@ class TestTrinoExecuteQuery:
         ]
 
         with patch.object(trino_client, "_get_connection", return_value=mock_connection):
-            df = trino_client.execute_query("SELECT id, value FROM t")
+            df = trino_client.query("SELECT id, value FROM t")
 
         assert len(df) == 2
         assert df.item(0, "value") is None
@@ -134,7 +134,7 @@ class TestTrinoExecuteQuery:
         mock_cursor.fetchall.return_value = []
 
         with patch.object(trino_client, "_get_connection", return_value=mock_connection):
-            df = trino_client.execute_query("SELECT id, name FROM empty_table")
+            df = trino_client.query("SELECT id, name FROM empty_table")
 
         assert isinstance(df, pl.DataFrame)
         assert df.columns == ["id", "name"]
@@ -146,7 +146,7 @@ class TestTrinoExecuteQuery:
         mock_cursor.fetchall.return_value = []
 
         with patch.object(trino_client, "_get_connection", return_value=mock_connection):
-            df = trino_client.execute_query("CREATE TABLE foo (id INT)")
+            df = trino_client.query("CREATE TABLE foo (id INT)")
 
         assert isinstance(df, pl.DataFrame)
         assert len(df) == 0
@@ -158,7 +158,7 @@ class TestTrinoExecuteQuery:
         mock_cursor.fetchmany.return_value = [(1,), (2,)]
 
         with patch.object(trino_client, "_get_connection", return_value=mock_connection):
-            df = trino_client.execute_query("SELECT id FROM t", max_rows=2)
+            df = trino_client.query("SELECT id FROM t", max_rows=2)
 
         mock_cursor.fetchmany.assert_called_once_with(2)
         assert len(df) == 2
@@ -168,7 +168,7 @@ class TestTrinoExecuteQuery:
 
         with patch.object(trino_client, "_get_connection", return_value=mock_connection):
             with pytest.raises(Exception, match="Connection failed"):
-                trino_client.execute_query("SELECT 1")
+                trino_client.query("SELECT 1")
 
         mock_connection.close.assert_called_once()
 

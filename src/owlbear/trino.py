@@ -50,7 +50,7 @@ class TrinoClient:
 
         return connect(**params)
 
-    def execute_query(self, query: str, max_rows: int = 0) -> pl.DataFrame:
+    def query(self, query: str, max_rows: int = 0) -> pl.DataFrame:
         """Execute a query and return results as a Polars DataFrame.
 
         Args:

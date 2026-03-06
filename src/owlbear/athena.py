@@ -37,7 +37,7 @@ class AthenaClient:
         self.database = database
         self.output_location = output_location
 
-    def execute_query(
+    def query(
         self,
         query: str,
         wait_for_completion: bool = True,
@@ -112,7 +112,7 @@ class AthenaClient:
 
         raise TimeoutError(f"Query did not complete within {max_wait_time} seconds")
 
-    def get_results_polars(self, execution_id: str, max_rows: int = 1000) -> pl.DataFrame:
+    def results(self, execution_id: str, max_rows: int = 1000) -> pl.DataFrame:
         """Get query results as a Polars DataFrame using PyArrow for better type handling"""
         try:
             # Get first batch to extract schema

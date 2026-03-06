@@ -60,8 +60,8 @@ client = AthenaClient(
     region="us-east-1"
 )
 
-execution_id = client.execute_query("SELECT * FROM orders LIMIT 5")
-df = client.get_results_polars(execution_id)
+execution_id = client.query("SELECT * FROM orders LIMIT 5")
+df = client.results(execution_id)
 print(df)
 ```
 
@@ -93,7 +93,7 @@ client = TrinoClient(
     schema="default",
 )
 
-df = client.execute_query("SELECT * FROM orders LIMIT 5")
+df = client.query("SELECT * FROM orders LIMIT 5")
 print(df)
 ```
 
@@ -139,8 +139,8 @@ ORDER BY total_spent DESC
 LIMIT 50
 """
 
-execution_id = client.execute_query(query, wait_for_completion=True)
-results_df = client.get_results_polars(execution_id)
+execution_id = client.query(query, wait_for_completion=True)
+results_df = client.results(execution_id)
 
 # Use Polars operations
 top_customers = results_df.filter(pl.col("total_spent") > 1000)
@@ -151,7 +151,7 @@ print(f"Found {len(top_customers)} high-value customers")
 
 ```python
 # Start query without waiting
-execution_id = client.execute_query(
+execution_id = client.query(
     "SELECT * FROM large_table",
     wait_for_completion=False
 )
@@ -162,25 +162,25 @@ print(f"Query status: {query_info['Status']['State']}")
 
 # Wait for completion and get results when ready
 client._wait_for_completion(execution_id)
-df = client.get_results_polars(execution_id)
+df = client.results(execution_id)
 ```
 
 ### Using Work Groups
 
 ```python
 # Execute query with a specific work group
-execution_id = client.execute_query(
+execution_id = client.query(
     query="SELECT COUNT(*) FROM my_table",
     work_group="my-workgroup"
 )
-df = client.get_results_polars(execution_id)
+df = client.results(execution_id)
 ```
 
 ### Handling Large Result Sets
 
 ```python
 # Get results with pagination (limit to 5000 rows)
-df = client.get_results_polars(execution_id, max_rows=5000)
+df = client.results(execution_id, max_rows=5000)
 
 # For larger datasets, consider using LIMIT in your SQL query
 # or processing results in chunks
@@ -235,8 +235,8 @@ print(f"Data processed: {query_info['Statistics']['DataProcessedInBytes']} bytes
 
 ```python
 try:
-    execution_id = client.execute_query("SELECT * FROM non_existent_table")
-    df = client.get_results_polars(execution_id)
+    execution_id = client.query("SELECT * FROM non_existent_table")
+    df = client.results(execution_id)
 except Exception as e:
     if "Query failed" in str(e):
         print(f"Query execution failed: {e}")
@@ -251,7 +251,7 @@ except Exception as e:
 ### Custom Query Context
 
 ```python
-execution_id = client.execute_query(
+execution_id = client.query(
     query="SELECT * FROM my_table",
     query_context={"Catalog": "my_catalog"},
     result_config={"EncryptionConfiguration": {"EncryptionOption": "SSE_S3"}}
@@ -264,7 +264,7 @@ The library automatically handles various Athena data types using PyArrow for pr
 
 ```python
 # Data types are automatically inferred and converted
-df = client.get_results_polars(execution_id)
+df = client.results(execution_id)
 
 # Check the inferred types
 print(df.dtypes)  # [Int32, Utf8, Float64, Boolean, Date32, etc.]

@@ -91,7 +91,7 @@ class TestAthenaClientInit:
 class TestExecuteQuery:
     """Test query execution"""
 
-    def test_execute_query_basic(self, athena_client):
+    def test_query_basic(self, athena_client):
         """Test basic query execution"""
         client, mock_athena = athena_client
         mock_athena.start_query_execution.return_value = {'QueryExecutionId': 'test-id'}
@@ -99,7 +99,7 @@ class TestExecuteQuery:
             'QueryExecution': {'Status': {'State': 'SUCCEEDED'}}
         }
 
-        result = client.execute_query("SELECT * FROM test_table")
+        result = client.query("SELECT * FROM test_table")
 
         assert result == "test-id"
         mock_athena.start_query_execution.assert_called_once()
@@ -108,17 +108,17 @@ class TestExecuteQuery:
         assert call_args['QueryExecutionContext']['Database'] == "test_db"
         assert call_args['ResultConfiguration']['OutputLocation'] == "s3://test-bucket/results/"
 
-    def test_execute_query_no_wait(self, athena_client):
+    def test_query_no_wait(self, athena_client):
         """Test query execution without waiting"""
         client, mock_athena = athena_client
         mock_athena.start_query_execution.return_value = {'QueryExecutionId': 'test-id'}
 
-        result = client.execute_query("SELECT * FROM test_table", wait_for_completion=False)
+        result = client.query("SELECT * FROM test_table", wait_for_completion=False)
 
         assert result == "test-id"
         mock_athena.get_query_execution.assert_not_called()
 
-    def test_execute_query_with_workgroup(self, athena_client):
+    def test_query_with_workgroup(self, athena_client):
         """Test query execution with work group"""
         client, mock_athena = athena_client
         mock_athena.start_query_execution.return_value = {'QueryExecutionId': 'test-id'}
@@ -126,18 +126,18 @@ class TestExecuteQuery:
             'QueryExecution': {'Status': {'State': 'SUCCEEDED'}}
         }
 
-        client.execute_query("SELECT * FROM test_table", work_group="test-workgroup")
+        client.query("SELECT * FROM test_table", work_group="test-workgroup")
 
         call_args = mock_athena.start_query_execution.call_args[1]
         assert call_args['WorkGroup'] == "test-workgroup"
 
-    def test_execute_query_failure(self, athena_client):
+    def test_query_failure(self, athena_client):
         """Test query execution failure"""
         client, mock_athena = athena_client
         mock_athena.start_query_execution.side_effect = Exception("AWS Error")
 
         with pytest.raises(Exception, match="Failed to execute query: AWS Error"):
-            client.execute_query("SELECT * FROM test_table")
+            client.query("SELECT * FROM test_table")
 
 
 class TestWaitForCompletion:
@@ -192,7 +192,7 @@ class TestWaitForCompletion:
 
 
 class TestGetResultsPolars:
-    """Test get_results_polars method"""
+    """Test results method"""
 
     def test_get_results_basic(self, athena_client):
         """Test basic results retrieval with PyArrow type handling"""
@@ -218,7 +218,7 @@ class TestGetResultsPolars:
             }
         }
 
-        df = client.get_results_polars('test-id')
+        df = client.results('test-id')
 
         assert isinstance(df, pl.DataFrame)
         assert df.columns == ['id', 'name', 'age']
@@ -253,7 +253,7 @@ class TestGetResultsPolars:
             }
         }
 
-        df = client.get_results_polars('test-id')
+        df = client.results('test-id')
 
         assert isinstance(df, pl.DataFrame)
         assert df.columns == ['id', 'name']
@@ -279,7 +279,7 @@ class TestGetResultsPolars:
             }
         }
 
-        df = client.get_results_polars('test-id')
+        df = client.results('test-id')
 
         assert len(df) == 2
         assert df.item(0, 'id') == 1  # Should be converted to integer
@@ -315,7 +315,7 @@ class TestGetResultsPolars:
 
         mock_athena.get_query_results.side_effect = [first_response, second_response]
 
-        df = client.get_results_polars('test-id')
+        df = client.results('test-id')
 
         assert len(df) == 2
         assert df.item(0, 'id') == 1  # Should be converted to integer
@@ -328,7 +328,7 @@ class TestGetResultsPolars:
         mock_athena.get_query_results.side_effect = Exception("AWS Error")
 
         with pytest.raises(Exception, match="Failed to retrieve query results: AWS Error"):
-            client.get_results_polars('test-id')
+            client.results('test-id')
 
 
 class TestQueryInfo:
