@@ -1,6 +1,6 @@
 # owlbear
 
-<img src="owlbear.png" width="150" align="right" alt="Owlbear" />
+<img src="owlbear_framed.png" width="150" align="right" alt="Owlbear" />
 
 **Feathers and claws for your data lake.**
 
