@@ -4,7 +4,7 @@
 
 **Feathers and claws for your data lake.**
 
-Owlbear is a Python client that connects AWS Athena to Polars DataFrames. A wise chimera — part **Owl** ([Athena](https://aws.amazon.com/athena/), goddess of wisdom), part **Bear** ([Polars](https://pola.rs/), the bear constellation). Query your data lake with SQL, get back fast, typed DataFrames — no pandas tax.
+Owlbear is a Python client that connects AWS Athena to Polars DataFrames. A wise chimera — part **Owl** ([Athena](https://aws.amazon.com/athena/), goddess of wisdom), part **Bear** ([Polars](https://pola.rs/), the bear constellation). Query your data lake with SQL, get back fast, typed DataFrames — no serialization or ODBC overhead.
 
 ## Features
 
