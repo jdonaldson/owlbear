@@ -1,27 +1,35 @@
 # owlbear
 
-<img src="wolpertinger.jpg" width="200" align="right" alt="Wolpertinger" />
-<sub>Image: <a href="https://en.wikipedia.org/wiki/Wolpertinger">Wolpertinger</a>, Wikimedia Commons</sub>
-
+<img src="owlbear.png" width="150" align="right" alt="Owlbear" />
 **Feathers and claws for your data lake.**
 
-Owlbear is a Python client that connects AWS Athena to Polars DataFrames. A wise chimera — part **Owl** ([Athena](https://aws.amazon.com/athena/), goddess of wisdom), part **Bear** ([Polars](https://pola.rs/), the bear constellation). Query your data lake with SQL, get back fast, typed DataFrames — no serialization or ODBC overhead.
+Owlbear is a Python client that bridges **Athena** and **Trino** to **Polars** DataFrames via PyArrow. A wise chimera — part **Owl** ([Athena](https://aws.amazon.com/athena/), goddess of wisdom), part **Bear** ([Polars](https://pola.rs/), the bear constellation). Query your data lake with SQL, get back fast, typed DataFrames — no serialization or ODBC overhead.
 
 ## Features
 
-- Execute Athena queries with automatic result retrieval as Polars DataFrames
-- Support for query execution with work groups and custom configurations
-- Pagination support for large result sets
+- **Two backends**: `AthenaClient` (AWS Athena via boto3) and `TrinoClient` (direct Trino connection)
+- Shared Presto-family type conversion — both backends produce identically typed Polars DataFrames
+- Pagination support for large result sets (Athena) and row limits (both)
 - Comprehensive error handling and timeout management
-- Query cancellation and execution monitoring
-- Built-in retry logic with exponential backoff
+- Query cancellation and execution monitoring (Athena)
+- Built-in retry logic with exponential backoff (Athena)
 
 ## Installation
 
 ### From GitHub (Git)
 
 ```bash
+# Core only (no backend)
 pip install git+https://github.com/jdonaldson/owlbear.git
+
+# With Athena backend
+pip install "owlbear[athena] @ git+https://github.com/jdonaldson/owlbear.git"
+
+# With Trino backend
+pip install "owlbear[trino] @ git+https://github.com/jdonaldson/owlbear.git"
+
+# Both backends
+pip install "owlbear[all] @ git+https://github.com/jdonaldson/owlbear.git"
 ```
 
 ### For Development
@@ -35,27 +43,41 @@ pip install -e ".[dev]"
 ## Prerequisites
 
 - Python 3.8+
-- AWS credentials configured (via AWS CLI, environment variables, or IAM roles)
-- Access to AWS Athena and an S3 bucket for query results
+- **Athena**: AWS credentials configured (via AWS CLI, environment variables, or IAM roles) and an S3 bucket for query results
+- **Trino**: A running Trino cluster with network access
 
 ## Quick Start
 
-```python
-import polars as pl
-from owlbear import OwlbearClient
+### Athena
 
-# Initialize the client
-client = OwlbearClient(
+```python
+from owlbear import AthenaClient
+
+client = AthenaClient(
     database="my_database",
     output_location="s3://my-bucket/athena-results/",
     region="us-east-1"
 )
 
-# Execute a query and get results as a Polars DataFrame
-query = "SELECT * FROM my_table LIMIT 100"
-execution_id = client.execute_query(query)
+execution_id = client.execute_query("SELECT * FROM my_table LIMIT 100")
 df = client.get_results_polars(execution_id)
+print(df.head())
+```
 
+### Trino
+
+```python
+from owlbear import TrinoClient
+
+client = TrinoClient(
+    host="trino.example.com",
+    port=443,
+    user="analyst",
+    catalog="hive",
+    schema="default",
+)
+
+df = client.execute_query("SELECT * FROM my_table LIMIT 100")
 print(df.head())
 ```
 
@@ -64,10 +86,10 @@ print(df.head())
 ### Basic Query Execution
 
 ```python
-from owlbear import OwlbearClient
+from owlbear import AthenaClient
 
 # Initialize client
-client = OwlbearClient(
+client = AthenaClient(
     database="analytics_db",
     output_location="s3://my-athena-results/queries/",
     region="us-west-2"
@@ -137,11 +159,11 @@ df = client.get_results_polars(execution_id, max_rows=5000)
 
 ```python
 import boto3
-from owlbear import OwlbearClient
+from owlbear import AthenaClient
 
 # Use existing session (useful for custom credential handling)
 session = boto3.Session(profile_name='my-profile')
-client = OwlbearClient.from_session(
+client = AthenaClient.from_session(
     session=session,
     database="my_db",
     output_location="s3://my-bucket/results/"
@@ -155,7 +177,7 @@ config = Config(
     retries={'max_attempts': 5}
 )
 
-client = OwlbearClient(
+client = AthenaClient(
     database="my_db",
     output_location="s3://my-bucket/results/",
     config=config
@@ -329,9 +351,15 @@ MIT License - see LICENSE file for details.
 
 ## Changelog
 
+### v0.2.0
+- Add `TrinoClient` for direct Trino connections
+- Rename `OwlbearClient` → `AthenaClient` (alias kept for backward compat)
+- Extract shared `presto_type_to_pyarrow` type converter
+- Make `boto3` and `trino` optional extras (`[athena]`, `[trino]`, `[all]`)
+
 ### v0.1.0 (2024-08-28)
 - Initial release
-- `OwlbearClient` for executing Athena SQL and returning typed Polars DataFrames via PyArrow
+- `AthenaClient` for executing Athena SQL and returning typed Polars DataFrames via PyArrow
 - Automatic Athena-to-PyArrow type mapping (integers, floats, decimals, timestamps, booleans, arrays, maps)
 - Paginated result retrieval with configurable row limits
 - Async query execution with exponential-backoff polling
