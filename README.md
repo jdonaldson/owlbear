@@ -15,6 +15,7 @@ Owlbear is a Python client that bridges **Athena** and **Trino** to **Polars** D
 - Pagination support for large result sets (Athena) and row limits (both)
 - Query cancellation and execution monitoring (Athena)
 - Built-in retry logic with exponential backoff (Athena)
+- **MCP server** for AI assistant integration (schema discovery + query execution)
 
 ## Installation
 
@@ -27,6 +28,9 @@ pip install "owlbear[trino]"
 
 # Both backends
 pip install "owlbear[all]"
+
+# MCP server (includes both backends)
+pip install "owlbear[mcp]"
 ```
 
 ### For Development
@@ -39,7 +43,7 @@ pip install -e ".[dev]"
 
 ## Prerequisites
 
-- Python 3.9+
+- Python 3.10+
 - **Athena**: AWS credentials configured (via AWS CLI, environment variables, or IAM roles) and an S3 bucket for query results
 - **Trino**: A running Trino cluster with network access
 
@@ -192,6 +196,68 @@ client.cancel_query(execution_id)
 query_info = client.get_query_info(execution_id)
 print(f"Execution time: {query_info['Statistics']['TotalExecutionTimeInMillis']}ms")
 print(f"Data processed: {query_info['Statistics']['DataProcessedInBytes']} bytes")
+```
+
+## MCP Server
+
+Owlbear includes an [MCP](https://modelcontextprotocol.io/) server so AI assistants can query your data lake directly. It exposes four tools: `execute_query`, `list_databases`, `list_tables`, and `describe_table`.
+
+### Install
+
+```bash
+pip install "owlbear[mcp]"
+```
+
+### Environment Variables
+
+| Variable | Backend | Description | Default |
+|---|---|---|---|
+| `OWLBEAR_BACKEND` | both | `athena` or `trino` | `athena` |
+| `OWLBEAR_DATABASE` | both | Default database/schema | `default` |
+| `OWLBEAR_S3_OUTPUT_LOCATION` | athena | S3 path for query results | (required) |
+| `AWS_REGION` | athena | AWS region | `us-east-1` |
+| `AWS_PROFILE` | athena | AWS profile (via boto3) | — |
+| `OWLBEAR_TRINO_HOST` | trino | Trino hostname | (required) |
+| `OWLBEAR_TRINO_PORT` | trino | Trino port | `443` |
+| `OWLBEAR_TRINO_USER` | trino | Trino user | — |
+| `OWLBEAR_TRINO_CATALOG` | trino | Trino catalog | — |
+
+### Example `.mcp.json` (Athena)
+
+```json
+{
+  "mcpServers": {
+    "owlbear": {
+      "command": "owlbear-mcp",
+      "env": {
+        "OWLBEAR_DATABASE": "my_database",
+        "OWLBEAR_S3_OUTPUT_LOCATION": "s3://my-bucket/athena-results/",
+        "AWS_REGION": "us-east-1",
+        "AWS_PROFILE": "my-profile"
+      }
+    }
+  }
+}
+```
+
+### Example `.mcp.json` (Trino)
+
+```json
+{
+  "mcpServers": {
+    "owlbear": {
+      "command": "owlbear-mcp",
+      "env": {
+        "OWLBEAR_BACKEND": "trino",
+        "OWLBEAR_TRINO_HOST": "trino.example.com",
+        "OWLBEAR_TRINO_PORT": "443",
+        "OWLBEAR_TRINO_USER": "analyst",
+        "OWLBEAR_TRINO_CATALOG": "hive",
+        "OWLBEAR_DATABASE": "default"
+      }
+    }
+  }
+}
 ```
 
 ## Type Mapping

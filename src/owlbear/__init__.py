@@ -3,5 +3,5 @@
 from .athena import AthenaClient
 from .trino import TrinoClient
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 __all__ = ["AthenaClient", "TrinoClient"]

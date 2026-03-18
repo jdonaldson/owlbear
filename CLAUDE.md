@@ -6,7 +6,7 @@ Owlbear is a Python client that bridges AWS Athena and Polars. It executes Athen
 ## Development Guidelines
 - Use Polars for all data processing operations
 - Follow Python packaging best practices with pyproject.toml
-- Maintain compatibility with Python 3.8+
+- Maintain compatibility with Python 3.10+
 
 ## Dependencies
 - polars: Core data processing library
@@ -23,4 +23,8 @@ Owlbear is a Python client that bridges AWS Athena and Polars. It executes Athen
 - Run tests: `pytest`
 - Format code: `black .`
 - Lint code: `ruff check .`
-- Type check: `mypy src/`
+- Type check: `mypy src/` or `pyright src/owlbear/`
+
+## Notes
+- Pre-commit hook blocks `Co-Authored-By:.*Claude` in commit messages
+- `dist/` has build artifacts from the PyPI upload (not gitignored but also not tracked)
