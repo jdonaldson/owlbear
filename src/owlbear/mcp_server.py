@@ -424,6 +424,75 @@ def generate_snippet(table: str, operation: str) -> str:
         return json.dumps({"error": str(e)})
 
 
+@mcp.tool()
+def explain_query(sql: str) -> str:
+    """Run EXPLAIN on a SQL query and return the query plan.
+
+    Args:
+        sql: The SQL query to explain.
+    """
+    try:
+        return _query_to_json(f"EXPLAIN {sql}", max_rows=_MAX_ROWS_CAP)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def search_tables(
+    pattern: str,
+    database: str | None = None,
+    limit: int = 0,
+    offset: int = 0,
+) -> str:
+    """Search for tables matching a SQL LIKE pattern (use ``%`` as wildcard).
+
+    Args:
+        pattern: SQL LIKE pattern (e.g. ``%order%`` to find all tables containing "order").
+        database: Optional database name. Uses the configured default if omitted.
+        limit: Maximum number of results to return (0 = no limit).
+        offset: Number of results to skip before returning.
+    """
+    try:
+        if database:
+            sql = f"SHOW TABLES IN {database} LIKE '{pattern}'"
+        else:
+            sql = f"SHOW TABLES LIKE '{pattern}'"
+        rows: list[dict[str, str]] = json.loads(
+            _query_to_json(sql, max_rows=_MAX_ROWS_CAP)
+        )
+        return _paginate(rows, limit, offset)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def show_partitions(table: str, limit: int = 0, offset: int = 0) -> str:
+    """Show partition keys and values for a partitioned table.
+
+    Args:
+        table: Fully-qualified or short table name (e.g. ``my_db.my_table``).
+        limit: Maximum number of results to return (0 = no limit).
+        offset: Number of results to skip before returning.
+    """
+    try:
+        client = _get_client()
+        if isinstance(client, TrinoClient):
+            parts = table.split(".")
+            if len(parts) == 2:
+                schema, tbl = parts
+                sql = f'SELECT * FROM "{schema}"."{tbl}$partitions"'
+            else:
+                sql = f'SELECT * FROM "{table}$partitions"'
+        else:
+            sql = f"SHOW PARTITIONS {table}"
+        rows: list[dict[str, str]] = json.loads(
+            _query_to_json(sql, max_rows=_MAX_ROWS_CAP)
+        )
+        return _paginate(rows, limit, offset)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
 # ---------------------------------------------------------------------------
 # MCP prompts
 # ---------------------------------------------------------------------------

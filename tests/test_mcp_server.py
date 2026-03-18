@@ -15,12 +15,15 @@ from owlbear.mcp_server import (
     _is_scalar_stat_type,
     _MAX_ROWS_CAP,
     execute_query,
+    explain_query,
     list_databases,
     list_tables,
+    search_tables,
     describe_table,
     get_schema_context,
     profile_table,
     generate_snippet,
+    show_partitions,
     explore_table,
     build_pipeline,
     get_config,
@@ -538,6 +541,145 @@ class TestGenerateSnippet:
         ):
             result = json.loads(generate_snippet("db.users", "load"))
         assert "error" in result
+
+
+# ---------------------------------------------------------------------------
+# explain_query tool
+# ---------------------------------------------------------------------------
+
+
+class TestExplainQuery:
+    def test_success(self):
+        plan = '[{"Query Plan": "TableScan ..."}]'
+        with patch(
+            "owlbear.mcp_server._query_to_json", return_value=plan
+        ) as mock_q:
+            result = explain_query("SELECT * FROM orders")
+            mock_q.assert_called_once_with(
+                "EXPLAIN SELECT * FROM orders", max_rows=_MAX_ROWS_CAP
+            )
+            assert result == plan
+
+    def test_error_returns_json(self):
+        with patch(
+            "owlbear.mcp_server._query_to_json",
+            side_effect=RuntimeError("syntax error"),
+        ):
+            result = explain_query("BAD SQL")
+            parsed = json.loads(result)
+            assert "error" in parsed
+            assert "syntax error" in parsed["error"]
+
+
+# ---------------------------------------------------------------------------
+# search_tables tool
+# ---------------------------------------------------------------------------
+
+
+class TestSearchTables:
+    def test_without_database(self):
+        with patch(
+            "owlbear.mcp_server._query_to_json", return_value="[]"
+        ) as mock_q:
+            result = json.loads(search_tables("%order%"))
+            mock_q.assert_called_once_with(
+                "SHOW TABLES LIKE '%order%'", max_rows=_MAX_ROWS_CAP
+            )
+            assert result == {"total": 0, "offset": 0, "limit": 0, "rows": []}
+
+    def test_with_database(self):
+        with patch(
+            "owlbear.mcp_server._query_to_json", return_value="[]"
+        ) as mock_q:
+            search_tables("%click%", database="analytics")
+            mock_q.assert_called_once_with(
+                "SHOW TABLES IN analytics LIKE '%click%'", max_rows=_MAX_ROWS_CAP
+            )
+
+    def test_pagination(self):
+        rows = json.dumps([{"tab_name": f"t{i}"} for i in range(5)])
+        with patch("owlbear.mcp_server._query_to_json", return_value=rows):
+            result = json.loads(search_tables("%t%", limit=2, offset=1))
+        assert result["total"] == 5
+        assert result["offset"] == 1
+        assert result["limit"] == 2
+        assert len(result["rows"]) == 2
+        assert result["rows"][0]["tab_name"] == "t1"
+
+    def test_error_returns_json(self):
+        with patch(
+            "owlbear.mcp_server._query_to_json", side_effect=Exception("fail")
+        ):
+            result = search_tables("%x%")
+            assert "error" in json.loads(result)
+
+
+# ---------------------------------------------------------------------------
+# show_partitions tool
+# ---------------------------------------------------------------------------
+
+
+class TestShowPartitions:
+    def test_athena_backend(self):
+        from owlbear.athena import AthenaClient
+
+        mock_athena = MagicMock(spec=AthenaClient)
+        rows = json.dumps([{"year": "2024", "month": "01"}])
+        with patch("owlbear.mcp_server._get_client", return_value=mock_athena), \
+             patch("owlbear.mcp_server._query_to_json", return_value=rows) as mock_q:
+            result = json.loads(show_partitions("db.events"))
+        mock_q.assert_called_once_with(
+            "SHOW PARTITIONS db.events", max_rows=_MAX_ROWS_CAP
+        )
+        assert result["total"] == 1
+        assert result["rows"] == [{"year": "2024", "month": "01"}]
+
+    def test_trino_qualified_table(self):
+        from owlbear.trino import TrinoClient
+
+        mock_trino = MagicMock(spec=TrinoClient)
+        rows = json.dumps([{"year": "2024"}])
+        with patch("owlbear.mcp_server._get_client", return_value=mock_trino), \
+             patch("owlbear.mcp_server._query_to_json", return_value=rows) as mock_q:
+            result = json.loads(show_partitions("mydb.events"))
+        mock_q.assert_called_once_with(
+            'SELECT * FROM "mydb"."events$partitions"', max_rows=_MAX_ROWS_CAP
+        )
+        assert result["total"] == 1
+
+    def test_trino_unqualified_table(self):
+        from owlbear.trino import TrinoClient
+
+        mock_trino = MagicMock(spec=TrinoClient)
+        rows = json.dumps([])
+        with patch("owlbear.mcp_server._get_client", return_value=mock_trino), \
+             patch("owlbear.mcp_server._query_to_json", return_value=rows) as mock_q:
+            result = json.loads(show_partitions("events"))
+        mock_q.assert_called_once_with(
+            'SELECT * FROM "events$partitions"', max_rows=_MAX_ROWS_CAP
+        )
+        assert result["total"] == 0
+
+    def test_pagination(self):
+        from owlbear.athena import AthenaClient
+
+        mock_athena = MagicMock(spec=AthenaClient)
+        rows = json.dumps([{"p": f"v{i}"} for i in range(6)])
+        with patch("owlbear.mcp_server._get_client", return_value=mock_athena), \
+             patch("owlbear.mcp_server._query_to_json", return_value=rows):
+            result = json.loads(show_partitions("t", limit=2, offset=3))
+        assert result["total"] == 6
+        assert result["offset"] == 3
+        assert result["limit"] == 2
+        assert len(result["rows"]) == 2
+
+    def test_error_returns_json(self):
+        with patch(
+            "owlbear.mcp_server._get_client",
+            side_effect=RuntimeError("no backend"),
+        ):
+            result = show_partitions("bad_table")
+            assert "error" in json.loads(result)
 
 
 # ---------------------------------------------------------------------------

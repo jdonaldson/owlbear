@@ -30,4 +30,4 @@ Owlbear is a Python client that bridges AWS Athena and Polars. It executes Athen
 - `dist/` has build artifacts from the PyPI upload (not gitignored but also not tracked)
 - Athena `DESCRIBE` fails on partitioned tables with ragged metadata — always use `_get_columns()` (information_schema first, DESCRIBE fallback) for schema introspection
 - Release flow: bump version in pyproject.toml, commit, push, `python -m build`, `python -m twine upload dist/owlbear-X.Y.Z*`
-- MCP server (v0.5.0): 7 tools (with pagination + TABLESAMPLE + backend-aware snippets), 2 prompts, 1 resource — configured in `~/.mcp.json`
+- MCP server (v0.6.0): 10 tools (with pagination + TABLESAMPLE + backend-aware snippets + explain/search/partitions), 2 prompts, 1 resource — configured in `~/.mcp.json`

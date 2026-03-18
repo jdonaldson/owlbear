@@ -213,12 +213,15 @@ pip install "owlbear[mcp]"
 | Tool | Description |
 |---|---|
 | `execute_query(sql, max_rows=500)` | Run arbitrary SQL, return JSON rows (max_rows capped at 10,000) |
+| `explain_query(sql)` | Run `EXPLAIN` on a query and return the query plan |
 | `list_databases(limit=0, offset=0)` | List all available databases (paginated) |
 | `list_tables(database?, limit=0, offset=0)` | List tables in a database (paginated, defaults to configured database) |
+| `search_tables(pattern, database?, limit=0, offset=0)` | Search for tables matching a SQL `LIKE` pattern (`%` wildcard) |
 | `describe_table(table)` | Show columns and types for a table |
 | `get_schema_context(tables)` | Batch describe multiple comma-separated tables at once |
 | `profile_table(table, sample_size=100, stats_sample_pct=0)` | One-call profiling: schema, row count, column stats, sample rows. Use `stats_sample_pct` (1-100) to sample stats on large tables |
 | `generate_snippet(table, operation)` | Generate backend-aware owlbear + Polars Python code (`load`, `filter`, `aggregate`, `join`) |
+| `show_partitions(table, limit=0, offset=0)` | Show partition keys and values for a partitioned table |
 
 ### Prompts
 
@@ -295,6 +298,18 @@ print(result.head())
 ```
 
 With `OWLBEAR_BACKEND=trino`, the snippet uses `TrinoClient` and the simpler `client.query()` → DataFrame API (no `execution_id` / `client.results()`).
+
+### Example: Search for Tables
+
+> Find all tables with "order" in the name
+
+The assistant calls `search_tables("%order%")` and gets back a paginated list of matching tables — useful for discovering tables in large data lakes without knowing exact names.
+
+### Example: Show Partitions
+
+> What partitions does the events table have?
+
+The assistant calls `show_partitions("analytics.events")` and gets back partition key/value pairs. On Athena this runs `SHOW PARTITIONS`, on Trino it queries the `$partitions` metadata table. Knowing the partition structure helps write cost-efficient queries that avoid full table scans.
 
 ### Environment Variables
 
