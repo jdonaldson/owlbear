@@ -213,12 +213,12 @@ pip install "owlbear[mcp]"
 | Tool | Description |
 |---|---|
 | `execute_query(sql, max_rows=500)` | Run arbitrary SQL, return JSON rows (max_rows capped at 10,000) |
-| `list_databases()` | List all available databases |
-| `list_tables(database?)` | List tables in a database (defaults to configured database) |
+| `list_databases(limit=0, offset=0)` | List all available databases (paginated) |
+| `list_tables(database?, limit=0, offset=0)` | List tables in a database (paginated, defaults to configured database) |
 | `describe_table(table)` | Show columns and types for a table |
 | `get_schema_context(tables)` | Batch describe multiple comma-separated tables at once |
-| `profile_table(table, sample_size=100)` | One-call profiling: schema, row count, column stats, sample rows |
-| `generate_snippet(table, operation)` | Generate owlbear + Polars Python code (`load`, `filter`, `aggregate`, `join`) |
+| `profile_table(table, sample_size=100, stats_sample_pct=0)` | One-call profiling: schema, row count, column stats, sample rows. Use `stats_sample_pct` (1-100) to sample stats on large tables |
+| `generate_snippet(table, operation)` | Generate backend-aware owlbear + Polars Python code (`load`, `filter`, `aggregate`, `join`) |
 
 ### Prompts
 
@@ -253,11 +253,19 @@ The assistant calls `profile_table("orders")` and gets back:
     {"column": "status", "type": "varchar", "null_count": 0, "distinct_count": 4, "min": "cancelled", "max": "shipped"},
     {"column": "items", "type": "array<varchar>", "null_count": 85}
   ],
-  "sample_rows": [{"order_id": 1, "customer_id": 1001, "order_date": "2023-01-01", "amount": 249.99, "status": "shipped", "items": ["widget-a", "widget-b"]}]
+  "sample_rows": [{"order_id": 1, "customer_id": 1001, "order_date": "2023-01-01", "amount": 249.99, "status": "shipped", "items": ["widget-a", "widget-b"]}],
+  "stats_sampled": false,
+  "stats_sample_pct": 0
 }
 ```
 
 Scalar columns (numbers, strings, dates) get `distinct_count`, `min`, and `max`. Complex columns (arrays, maps, structs) get only `null_count`.
+
+For large tables, use `stats_sample_pct` to avoid full table scans on the stats query:
+
+> Profile the orders table with 10% sampling
+
+The assistant calls `profile_table("orders", stats_sample_pct=10)` — the stats query uses `TABLESAMPLE BERNOULLI(10)` while row count remains exact via `COUNT(*)`.
 
 ### Example: Batch Schema Lookup
 
@@ -269,7 +277,7 @@ The assistant calls `get_schema_context("mydb.orders, mydb.customers")` and gets
 
 > Generate an aggregation snippet for the orders table
 
-The assistant calls `generate_snippet("orders", "aggregate")` and returns Python code using real column names:
+The assistant calls `generate_snippet("orders", "aggregate")` and returns backend-aware Python code using real column names. With `OWLBEAR_BACKEND=athena`:
 
 ```python
 from owlbear import AthenaClient
@@ -285,6 +293,8 @@ df = client.results(eid)
 result = df.group_by("status").agg(pl.col("amount").mean())
 print(result.head())
 ```
+
+With `OWLBEAR_BACKEND=trino`, the snippet uses `TrinoClient` and the simpler `client.query()` → DataFrame API (no `execution_id` / `client.results()`).
 
 ### Environment Variables
 

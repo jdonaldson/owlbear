@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "owlbear"
-version = "0.4.1"
+version = "0.5.0"
 description = "Feathers and claws for your data lake"
 authors = [{name = "J. Justin Donaldson", email = "jjd@jjd.io"}]
 license = {text = "MIT"}

@@ -8,7 +8,10 @@ from unittest.mock import patch, MagicMock
 from owlbear.mcp_server import (
     _get_client,
     _get_columns,
+    _paginate,
     _query_to_json,
+    _snippet_header,
+    _snippet_query,
     _is_scalar_stat_type,
     _MAX_ROWS_CAP,
     execute_query,
@@ -197,9 +200,21 @@ class TestListDatabases:
         with patch(
             "owlbear.mcp_server._query_to_json", return_value='[{"database":"db1"}]'
         ) as mock_q:
-            result = list_databases()
+            result = json.loads(list_databases())
             mock_q.assert_called_once_with("SHOW DATABASES", max_rows=_MAX_ROWS_CAP)
-            assert json.loads(result) == [{"database": "db1"}]
+            assert result["total"] == 1
+            assert result["rows"] == [{"database": "db1"}]
+
+    def test_pagination(self):
+        rows = json.dumps([{"database": f"db{i}"} for i in range(5)])
+        with patch("owlbear.mcp_server._query_to_json", return_value=rows):
+            result = json.loads(list_databases(limit=2, offset=1))
+        assert result["total"] == 5
+        assert result["offset"] == 1
+        assert result["limit"] == 2
+        assert len(result["rows"]) == 2
+        assert result["rows"][0]["database"] == "db1"
+        assert result["rows"][1]["database"] == "db2"
 
     def test_error_returns_json(self):
         with patch(
@@ -214,8 +229,9 @@ class TestListTables:
         with patch(
             "owlbear.mcp_server._query_to_json", return_value="[]"
         ) as mock_q:
-            list_tables()
+            result = json.loads(list_tables())
             mock_q.assert_called_once_with("SHOW TABLES", max_rows=_MAX_ROWS_CAP)
+            assert result == {"total": 0, "offset": 0, "limit": 0, "rows": []}
 
     def test_with_database(self):
         with patch(
@@ -225,6 +241,16 @@ class TestListTables:
             mock_q.assert_called_once_with(
                 "SHOW TABLES IN analytics", max_rows=_MAX_ROWS_CAP
             )
+
+    def test_pagination(self):
+        rows = json.dumps([{"tab_name": f"t{i}"} for i in range(10)])
+        with patch("owlbear.mcp_server._query_to_json", return_value=rows):
+            result = json.loads(list_tables(limit=3, offset=2))
+        assert result["total"] == 10
+        assert result["offset"] == 2
+        assert result["limit"] == 3
+        assert len(result["rows"]) == 3
+        assert result["rows"][0]["tab_name"] == "t2"
 
     def test_error_returns_json(self):
         with patch(
@@ -363,6 +389,61 @@ class TestProfileTable:
         assert "distinct_count" not in tags_col
         assert len(result["sample_rows"]) == 1
 
+    def test_stats_sampled(self):
+        columns = [
+            {"column_name": "id", "data_type": "bigint"},
+        ]
+        count_resp = json.dumps([{"cnt": 1000}])
+        stats_resp = json.dumps([{
+            "id__null_count": 0,
+            "id__distinct_count": 100,
+            "id__min": "1",
+            "id__max": "1000",
+        }])
+        sample_resp = json.dumps([{"id": 1}])
+
+        calls: list[str] = []
+
+        def capture_query(sql: str, max_rows: int) -> str:
+            calls.append(sql)
+            if "COUNT(*)" in sql:
+                return count_resp
+            if "LIMIT" in sql:
+                return sample_resp
+            return stats_resp
+
+        with patch("owlbear.mcp_server._get_columns", return_value=columns), \
+             patch("owlbear.mcp_server._query_to_json", side_effect=capture_query):
+            result = json.loads(profile_table("db.events", stats_sample_pct=10))
+
+        assert result["stats_sampled"] is True
+        assert result["stats_sample_pct"] == 10
+        # The stats query should use TABLESAMPLE
+        stats_sql = [c for c in calls if "null_count" in c][0]
+        assert "TABLESAMPLE BERNOULLI(10)" in stats_sql
+        # Row count should NOT use TABLESAMPLE
+        count_sql = [c for c in calls if "COUNT(*)" in c][0]
+        assert "TABLESAMPLE" not in count_sql
+
+    def test_stats_not_sampled_by_default(self):
+        columns = [{"column_name": "id", "data_type": "bigint"}]
+        count_resp = json.dumps([{"cnt": 5}])
+        stats_resp = json.dumps([{
+            "id__null_count": 0, "id__distinct_count": 5,
+            "id__min": "1", "id__max": "5",
+        }])
+        sample_resp = json.dumps([{"id": 1}])
+
+        with patch("owlbear.mcp_server._get_columns", return_value=columns), \
+             patch(
+                "owlbear.mcp_server._query_to_json",
+                side_effect=[count_resp, stats_resp, sample_resp],
+             ):
+            result = json.loads(profile_table("db.events"))
+
+        assert result["stats_sampled"] is False
+        assert result["stats_sample_pct"] == 0
+
     def test_error(self):
         with patch(
             "owlbear.mcp_server._get_columns",
@@ -430,7 +511,19 @@ class TestGenerateSnippet:
             result = json.loads(generate_snippet("db.users", operation))
         assert result["table"] == "db.users"
         assert result["operation"] == operation
+        assert result["backend"] == "athena"
         assert "AthenaClient" in result["snippet"]
+        assert "db.users" in result["snippet"]
+
+    @pytest.mark.parametrize("operation", ["load", "filter", "aggregate", "join"])
+    def test_trino_backend(self, operation: str):
+        env = {"OWLBEAR_BACKEND": "trino"}
+        with patch.dict("os.environ", env, clear=False), \
+             patch("owlbear.mcp_server._get_columns", return_value=self._mock_columns):
+            result = json.loads(generate_snippet("db.users", operation))
+        assert result["backend"] == "trino"
+        assert "TrinoClient" in result["snippet"]
+        assert "client.results(" not in result["snippet"]
         assert "db.users" in result["snippet"]
 
     def test_unknown_operation(self):

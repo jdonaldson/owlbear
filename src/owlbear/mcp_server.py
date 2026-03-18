@@ -120,6 +120,54 @@ def _get_columns(table: str) -> list[dict[str, str]]:
     return [row for row in raw if not row.get("col_name", "").startswith("#")]
 
 
+def _paginate(rows: list[dict[str, str]], limit: int, offset: int) -> str:
+    """Apply offset/limit to *rows* and return a JSON envelope."""
+    total = len(rows)
+    sliced = rows[offset:] if limit == 0 else rows[offset : offset + limit]
+    return json.dumps(
+        {"total": total, "offset": offset, "limit": limit, "rows": sliced},
+        default=str,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Snippet helpers — backend-aware code generation
+# ---------------------------------------------------------------------------
+
+
+def _snippet_header(backend: str) -> str:
+    """Return the import + client-init block for *backend*."""
+    if backend == "trino":
+        return (
+            "from owlbear import TrinoClient\n"
+            "import polars as pl\n\n"
+            "client = TrinoClient(\n"
+            '    host="your_host",\n'
+            "    port=443,\n"
+            '    catalog="your_catalog",\n'
+            '    schema="your_schema",\n'
+            ")\n\n"
+        )
+    return (
+        "from owlbear import AthenaClient\n"
+        "import polars as pl\n\n"
+        "client = AthenaClient(\n"
+        '    database="your_database",\n'
+        '    output_location="s3://your-bucket/results/",\n'
+        ")\n\n"
+    )
+
+
+def _snippet_query(backend: str, sql: str) -> str:
+    """Return the query + result lines for *backend*."""
+    if backend == "trino":
+        return f'df = client.query("{sql}")\n'
+    return (
+        f'eid = client.query("{sql}")\n'
+        "df = client.results(eid)\n"
+    )
+
+
 # ---------------------------------------------------------------------------
 # MCP tools
 # ---------------------------------------------------------------------------
@@ -140,24 +188,37 @@ def execute_query(sql: str, max_rows: int = 500) -> str:
 
 
 @mcp.tool()
-def list_databases() -> str:
-    """List all databases available in the data lake."""
+def list_databases(limit: int = 0, offset: int = 0) -> str:
+    """List all databases available in the data lake.
+
+    Args:
+        limit: Maximum number of results to return (0 = no limit).
+        offset: Number of results to skip before returning.
+    """
     try:
-        return _query_to_json("SHOW DATABASES", max_rows=_MAX_ROWS_CAP)
+        rows: list[dict[str, str]] = json.loads(
+            _query_to_json("SHOW DATABASES", max_rows=_MAX_ROWS_CAP)
+        )
+        return _paginate(rows, limit, offset)
     except Exception as e:
         return json.dumps({"error": str(e)})
 
 
 @mcp.tool()
-def list_tables(database: str | None = None) -> str:
+def list_tables(database: str | None = None, limit: int = 0, offset: int = 0) -> str:
     """List tables in a database (defaults to the configured database).
 
     Args:
         database: Optional database name. Uses the configured default if omitted.
+        limit: Maximum number of results to return (0 = no limit).
+        offset: Number of results to skip before returning.
     """
     try:
         sql = f"SHOW TABLES IN {database}" if database else "SHOW TABLES"
-        return _query_to_json(sql, max_rows=_MAX_ROWS_CAP)
+        rows: list[dict[str, str]] = json.loads(
+            _query_to_json(sql, max_rows=_MAX_ROWS_CAP)
+        )
+        return _paginate(rows, limit, offset)
     except Exception as e:
         return json.dumps({"error": str(e)})
 
@@ -194,18 +255,20 @@ def get_schema_context(tables: str) -> str:
 
 
 @mcp.tool()
-def profile_table(table: str, sample_size: int = 100) -> str:
+def profile_table(table: str, sample_size: int = 100, stats_sample_pct: int = 0) -> str:
     """Profile a table: schema, row count, column stats, and sample rows.
 
     Args:
         table: Fully-qualified or short table name.
         sample_size: Number of sample rows to return (default 100).
+        stats_sample_pct: Percentage for TABLESAMPLE BERNOULLI on stats query
+            (0 = full scan, 1-100 = sampled). Row count always uses full COUNT(*).
     """
     try:
         # 1. Schema
         columns = _get_columns(table)
 
-        # 2. Row count
+        # 2. Row count (always exact)
         count_raw = json.loads(_query_to_json(f"SELECT COUNT(*) AS cnt FROM {table}", max_rows=1))
         row_count = count_raw[0]["cnt"] if count_raw else None
 
@@ -227,8 +290,12 @@ def profile_table(table: str, sample_size: int = 100) -> str:
                     f"CAST(MAX({quoted}) AS VARCHAR) AS \"{name}__max\""
                 )
 
+        stats_sampled = 0 < stats_sample_pct <= 100
         if stat_parts:
-            stats_sql = f"SELECT {', '.join(stat_parts)} FROM {table}"
+            source = table
+            if stats_sampled:
+                source = f"{table} TABLESAMPLE BERNOULLI({stats_sample_pct})"
+            stats_sql = f"SELECT {', '.join(stat_parts)} FROM {source}"
             stats_raw = json.loads(_query_to_json(stats_sql, max_rows=1))
             stats_row = stats_raw[0] if stats_raw else {}
         else:
@@ -261,6 +328,8 @@ def profile_table(table: str, sample_size: int = 100) -> str:
                 "row_count": row_count,
                 "columns": column_stats,
                 "sample_rows": sample_raw,
+                "stats_sampled": stats_sampled,
+                "stats_sample_pct": stats_sample_pct if stats_sampled else 0,
             },
             default=str,
         )
@@ -282,6 +351,7 @@ def generate_snippet(table: str, operation: str) -> str:
 
     try:
         columns = _get_columns(table)
+        backend = os.environ.get("OWLBEAR_BACKEND", "athena").lower()
 
         col_names = [c.get("col_name", c.get("column_name", "")) for c in columns]
         col_types = [c.get("data_type", c.get("type", "")) for c in columns]
@@ -296,54 +366,55 @@ def generate_snippet(table: str, operation: str) -> str:
             col_names[0] if col_names else "col",
         )
 
-        header = (
-            "from owlbear import AthenaClient\n"
-            "import polars as pl\n\n"
-            "client = AthenaClient(\n"
-            '    database="your_database",\n'
-            '    output_location="s3://your-bucket/results/",\n'
-            ")\n\n"
-        )
+        header = _snippet_header(backend)
 
         if operation == "load":
             snippet = (
                 header
-                + f'eid = client.query("SELECT * FROM {table} LIMIT 1000")\n'
-                + "df = client.results(eid)\n"
+                + _snippet_query(backend, f"SELECT * FROM {table} LIMIT 1000")
                 + "print(df.head())\n"
             )
         elif operation == "filter":
             snippet = (
                 header
-                + f'eid = client.query("SELECT * FROM {table} WHERE \\"{string_col}\\\\" IS NOT NULL LIMIT 1000")\n'
-                + "df = client.results(eid)\n"
+                + _snippet_query(backend, f'SELECT * FROM {table} WHERE \\"{string_col}\\\\" IS NOT NULL LIMIT 1000')
                 + f'filtered = df.filter(pl.col("{string_col}").is_not_null())\n'
                 + "print(filtered.head())\n"
             )
         elif operation == "aggregate":
             snippet = (
                 header
-                + f'eid = client.query("SELECT * FROM {table} LIMIT 10000")\n'
-                + "df = client.results(eid)\n"
+                + _snippet_query(backend, f"SELECT * FROM {table} LIMIT 10000")
                 + f'result = df.group_by("{string_col}").agg(pl.col("{numeric_col}").mean())\n'
                 + "print(result.head())\n"
             )
         else:  # join
-            snippet = (
-                header
-                + f'eid1 = client.query("SELECT * FROM {table} LIMIT 1000")\n'
-                + "df1 = client.results(eid1)\n\n"
-                + '# Load a second table to join with\n'
-                + 'eid2 = client.query("SELECT * FROM other_table LIMIT 1000")\n'
-                + "df2 = client.results(eid2)\n\n"
-                + f'joined = df1.join(df2, on="{col_names[0] if col_names else "id"}", how="inner")\n'
-                + "print(joined.head())\n"
-            )
+            if backend == "trino":
+                snippet = (
+                    header
+                    + f'df1 = client.query("SELECT * FROM {table} LIMIT 1000")\n\n'
+                    + "# Load a second table to join with\n"
+                    + 'df2 = client.query("SELECT * FROM other_table LIMIT 1000")\n\n'
+                    + f'joined = df1.join(df2, on="{col_names[0] if col_names else "id"}", how="inner")\n'
+                    + "print(joined.head())\n"
+                )
+            else:
+                snippet = (
+                    header
+                    + f'eid1 = client.query("SELECT * FROM {table} LIMIT 1000")\n'
+                    + "df1 = client.results(eid1)\n\n"
+                    + "# Load a second table to join with\n"
+                    + 'eid2 = client.query("SELECT * FROM other_table LIMIT 1000")\n'
+                    + "df2 = client.results(eid2)\n\n"
+                    + f'joined = df1.join(df2, on="{col_names[0] if col_names else "id"}", how="inner")\n'
+                    + "print(joined.head())\n"
+                )
 
         return json.dumps(
             {
                 "table": table,
                 "operation": operation,
+                "backend": backend,
                 "columns": col_names,
                 "snippet": snippet,
             },
