@@ -86,6 +86,40 @@ def _is_scalar_stat_type(data_type: str) -> bool:
     return _SCALAR_STAT_PATTERN.match(data_type.strip()) is not None
 
 
+def _get_columns(table: str) -> list[dict[str, str]]:
+    """Get column names and types for *table*.
+
+    Tries ``information_schema.columns`` first (reliable), falls back to
+    ``DESCRIBE`` (which can fail on partitioned tables with ragged metadata).
+    """
+    # Parse schema/table from potentially qualified name
+    parts = table.split(".")
+    if len(parts) == 2:
+        schema, tbl = parts
+    else:
+        schema, tbl = None, parts[-1]
+
+    try:
+        where = f"table_name = '{tbl}'"
+        if schema:
+            where += f" AND table_schema = '{schema}'"
+        sql = (
+            "SELECT column_name, data_type "
+            "FROM information_schema.columns "
+            f"WHERE {where} "
+            "ORDER BY ordinal_position"
+        )
+        raw: list[dict[str, str]] = json.loads(_query_to_json(sql, max_rows=_MAX_ROWS_CAP))
+        if raw:
+            return raw
+    except Exception:
+        pass
+
+    # Fallback to DESCRIBE
+    raw = json.loads(_query_to_json(f"DESCRIBE {table}", max_rows=_MAX_ROWS_CAP))
+    return [row for row in raw if not row.get("col_name", "").startswith("#")]
+
+
 # ---------------------------------------------------------------------------
 # MCP tools
 # ---------------------------------------------------------------------------
@@ -136,7 +170,8 @@ def describe_table(table: str) -> str:
         table: Fully-qualified or short table name (e.g. ``my_db.my_table``).
     """
     try:
-        return _query_to_json(f"DESCRIBE {table}", max_rows=_MAX_ROWS_CAP)
+        columns = _get_columns(table)
+        return json.dumps(columns, default=str)
     except Exception as e:
         return json.dumps({"error": str(e)})
 
@@ -152,10 +187,7 @@ def get_schema_context(tables: str) -> str:
     result: dict[str, list[dict[str, str]] | str] = {}
     for table in table_list:
         try:
-            raw = json.loads(_query_to_json(f"DESCRIBE {table}", max_rows=_MAX_ROWS_CAP))
-            result[table] = [
-                row for row in raw if not row.get("col_name", "").startswith("#")
-            ]
+            result[table] = _get_columns(table)
         except Exception as e:
             result[table] = f"error: {e}"
     return json.dumps(result, default=str)
@@ -171,12 +203,7 @@ def profile_table(table: str, sample_size: int = 100) -> str:
     """
     try:
         # 1. Schema
-        describe_raw = json.loads(
-            _query_to_json(f"DESCRIBE {table}", max_rows=_MAX_ROWS_CAP)
-        )
-        columns = [
-            row for row in describe_raw if not row.get("col_name", "").startswith("#")
-        ]
+        columns = _get_columns(table)
 
         # 2. Row count
         count_raw = json.loads(_query_to_json(f"SELECT COUNT(*) AS cnt FROM {table}", max_rows=1))
@@ -254,12 +281,7 @@ def generate_snippet(table: str, operation: str) -> str:
         return json.dumps({"error": f"Unknown operation {operation!r}. Choose from: {', '.join(sorted(valid_ops))}"})
 
     try:
-        describe_raw = json.loads(
-            _query_to_json(f"DESCRIBE {table}", max_rows=_MAX_ROWS_CAP)
-        )
-        columns = [
-            row for row in describe_raw if not row.get("col_name", "").startswith("#")
-        ]
+        columns = _get_columns(table)
 
         col_names = [c.get("col_name", c.get("column_name", "")) for c in columns]
         col_types = [c.get("data_type", c.get("type", "")) for c in columns]

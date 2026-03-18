@@ -7,6 +7,7 @@ from unittest.mock import patch, MagicMock
 
 from owlbear.mcp_server import (
     _get_client,
+    _get_columns,
     _query_to_json,
     _is_scalar_stat_type,
     _MAX_ROWS_CAP,
@@ -235,20 +236,56 @@ class TestListTables:
 
 class TestDescribeTable:
     def test_success(self):
-        with patch(
-            "owlbear.mcp_server._query_to_json", return_value="[]"
-        ) as mock_q:
-            describe_table("my_db.my_table")
-            mock_q.assert_called_once_with(
-                "DESCRIBE my_db.my_table", max_rows=_MAX_ROWS_CAP
-            )
+        cols = [{"column_name": "id", "data_type": "bigint"}]
+        with patch("owlbear.mcp_server._get_columns", return_value=cols):
+            result = json.loads(describe_table("my_db.my_table"))
+        assert result == cols
 
     def test_error_returns_json(self):
         with patch(
-            "owlbear.mcp_server._query_to_json", side_effect=Exception("fail")
+            "owlbear.mcp_server._get_columns", side_effect=Exception("fail")
         ):
             result = describe_table("bad_table")
             assert "error" in json.loads(result)
+
+
+# ---------------------------------------------------------------------------
+# _get_columns helper
+# ---------------------------------------------------------------------------
+
+
+class TestGetColumns:
+    def test_information_schema_path(self):
+        info_resp = json.dumps([
+            {"column_name": "id", "data_type": "bigint"},
+            {"column_name": "name", "data_type": "varchar"},
+        ])
+        with patch("owlbear.mcp_server._query_to_json", return_value=info_resp):
+            result = _get_columns("mydb.mytable")
+        assert len(result) == 2
+        assert result[0]["column_name"] == "id"
+
+    def test_falls_back_to_describe(self):
+        describe_resp = json.dumps([
+            {"col_name": "x", "data_type": "int"},
+            {"col_name": "# Partition Information", "data_type": ""},
+        ])
+        with patch(
+            "owlbear.mcp_server._query_to_json",
+            side_effect=[RuntimeError("info_schema failed"), describe_resp],
+        ):
+            result = _get_columns("mydb.mytable")
+        assert len(result) == 1
+        assert result[0]["col_name"] == "x"
+
+    def test_unqualified_table_name(self):
+        info_resp = json.dumps([{"column_name": "a", "data_type": "int"}])
+        with patch("owlbear.mcp_server._query_to_json", return_value=info_resp) as mock_q:
+            _get_columns("mytable")
+        # Should not include table_schema in WHERE
+        call_sql = mock_q.call_args[0][0]
+        assert "table_schema" not in call_sql
+        assert "table_name = 'mytable'" in call_sql
 
 
 # ---------------------------------------------------------------------------
@@ -286,12 +323,11 @@ class TestIsScalarStatType:
 
 class TestProfileTable:
     def test_success(self):
-        describe_resp = json.dumps([
-            {"col_name": "id", "data_type": "bigint"},
-            {"col_name": "name", "data_type": "varchar"},
-            {"col_name": "tags", "data_type": "array<string>"},
-            {"col_name": "# Partition Information", "data_type": ""},
-        ])
+        columns = [
+            {"column_name": "id", "data_type": "bigint"},
+            {"column_name": "name", "data_type": "varchar"},
+            {"column_name": "tags", "data_type": "array<string>"},
+        ]
         count_resp = json.dumps([{"cnt": 42}])
         stats_resp = json.dumps([{
             "id__null_count": 0,
@@ -306,15 +342,16 @@ class TestProfileTable:
         }])
         sample_resp = json.dumps([{"id": 1, "name": "alice", "tags": ["a"]}])
 
-        with patch(
-            "owlbear.mcp_server._query_to_json",
-            side_effect=[describe_resp, count_resp, stats_resp, sample_resp],
-        ):
+        with patch("owlbear.mcp_server._get_columns", return_value=columns), \
+             patch(
+                "owlbear.mcp_server._query_to_json",
+                side_effect=[count_resp, stats_resp, sample_resp],
+             ):
             result = json.loads(profile_table("db.events", sample_size=10))
 
         assert result["table"] == "db.events"
         assert result["row_count"] == 42
-        assert len(result["columns"]) == 3  # partition row filtered
+        assert len(result["columns"]) == 3
         # scalar columns have distinct/min/max
         id_col = result["columns"][0]
         assert id_col["column"] == "id"
@@ -328,7 +365,7 @@ class TestProfileTable:
 
     def test_error(self):
         with patch(
-            "owlbear.mcp_server._query_to_json",
+            "owlbear.mcp_server._get_columns",
             side_effect=RuntimeError("timeout"),
         ):
             result = json.loads(profile_table("bad_table"))
@@ -342,26 +379,26 @@ class TestProfileTable:
 
 class TestGetSchemaContext:
     def test_multiple_tables(self):
-        t1_resp = json.dumps([{"col_name": "a", "data_type": "int"}])
-        t2_resp = json.dumps([{"col_name": "b", "data_type": "varchar"}])
+        t1_cols = [{"column_name": "a", "data_type": "int"}]
+        t2_cols = [{"column_name": "b", "data_type": "varchar"}]
 
         with patch(
-            "owlbear.mcp_server._query_to_json",
-            side_effect=[t1_resp, t2_resp],
+            "owlbear.mcp_server._get_columns",
+            side_effect=[t1_cols, t2_cols],
         ):
             result = json.loads(get_schema_context("db.t1, db.t2"))
 
         assert "db.t1" in result
         assert "db.t2" in result
-        assert result["db.t1"] == [{"col_name": "a", "data_type": "int"}]
-        assert result["db.t2"] == [{"col_name": "b", "data_type": "varchar"}]
+        assert result["db.t1"] == [{"column_name": "a", "data_type": "int"}]
+        assert result["db.t2"] == [{"column_name": "b", "data_type": "varchar"}]
 
     def test_partial_failure(self):
-        t1_resp = json.dumps([{"col_name": "a", "data_type": "int"}])
+        t1_cols = [{"column_name": "a", "data_type": "int"}]
 
         with patch(
-            "owlbear.mcp_server._query_to_json",
-            side_effect=[t1_resp, RuntimeError("no such table")],
+            "owlbear.mcp_server._get_columns",
+            side_effect=[t1_cols, RuntimeError("no such table")],
         ):
             result = json.loads(get_schema_context("db.t1, db.missing"))
 
@@ -372,15 +409,6 @@ class TestGetSchemaContext:
         result = json.loads(get_schema_context(""))
         assert result == {}
 
-    def test_filters_partition_rows(self):
-        resp = json.dumps([
-            {"col_name": "id", "data_type": "int"},
-            {"col_name": "# Partition Information", "data_type": ""},
-        ])
-        with patch("owlbear.mcp_server._query_to_json", return_value=resp):
-            result = json.loads(get_schema_context("db.t1"))
-        assert len(result["db.t1"]) == 1
-
 
 # ---------------------------------------------------------------------------
 # generate_snippet tool
@@ -388,17 +416,16 @@ class TestGetSchemaContext:
 
 
 class TestGenerateSnippet:
-    def _mock_describe(self):
-        return json.dumps([
-            {"col_name": "user_id", "data_type": "bigint"},
-            {"col_name": "name", "data_type": "varchar"},
-            {"col_name": "score", "data_type": "double"},
-        ])
+    _mock_columns = [
+        {"column_name": "user_id", "data_type": "bigint"},
+        {"column_name": "name", "data_type": "varchar"},
+        {"column_name": "score", "data_type": "double"},
+    ]
 
     @pytest.mark.parametrize("operation", ["load", "filter", "aggregate", "join"])
     def test_operations(self, operation: str):
         with patch(
-            "owlbear.mcp_server._query_to_json", return_value=self._mock_describe()
+            "owlbear.mcp_server._get_columns", return_value=self._mock_columns
         ):
             result = json.loads(generate_snippet("db.users", operation))
         assert result["table"] == "db.users"
@@ -413,7 +440,7 @@ class TestGenerateSnippet:
 
     def test_error_during_describe(self):
         with patch(
-            "owlbear.mcp_server._query_to_json",
+            "owlbear.mcp_server._get_columns",
             side_effect=RuntimeError("access denied"),
         ):
             result = json.loads(generate_snippet("db.users", "load"))
