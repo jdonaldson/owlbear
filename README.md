@@ -200,12 +200,90 @@ print(f"Data processed: {query_info['Statistics']['DataProcessedInBytes']} bytes
 
 ## MCP Server
 
-Owlbear includes an [MCP](https://modelcontextprotocol.io/) server so AI assistants can query your data lake directly. It exposes four tools: `execute_query`, `list_databases`, `list_tables`, and `describe_table`.
+Owlbear includes an [MCP](https://modelcontextprotocol.io/) server so AI assistants can query your data lake directly.
 
 ### Install
 
 ```bash
 pip install "owlbear[mcp]"
+```
+
+### Tools
+
+| Tool | Description |
+|---|---|
+| `execute_query(sql, max_rows=500)` | Run arbitrary SQL, return JSON rows (max_rows capped at 10,000) |
+| `list_databases()` | List all available databases |
+| `list_tables(database?)` | List tables in a database (defaults to configured database) |
+| `describe_table(table)` | Show columns and types for a table |
+| `get_schema_context(tables)` | Batch describe multiple comma-separated tables at once |
+| `profile_table(table, sample_size=100)` | One-call profiling: schema, row count, column stats, sample rows |
+| `generate_snippet(table, operation)` | Generate owlbear + Polars Python code (`load`, `filter`, `aggregate`, `join`) |
+
+### Prompts
+
+| Prompt | Description |
+|---|---|
+| `explore_table(table)` | Guided exploration: describe schema, sample rows, suggest queries, summarize |
+| `build_pipeline(table, goal)` | Generate a data pipeline with owlbear boilerplate for a stated goal |
+
+### Resource
+
+| URI | Description |
+|---|---|
+| `owlbear://config` | Current backend configuration (type, database, region/host) |
+
+### Example: Profile a Table
+
+Ask your AI assistant:
+
+> Profile the `orders` table
+
+The assistant calls `profile_table("orders")` and gets back:
+
+```json
+{
+  "table": "orders",
+  "row_count": 156398,
+  "columns": [
+    {"column": "order_id", "type": "bigint", "null_count": 0, "distinct_count": 156398, "min": "1", "max": "156398"},
+    {"column": "customer_id", "type": "bigint", "null_count": 0, "distinct_count": 8423, "min": "1001", "max": "9999"},
+    {"column": "order_date", "type": "date", "null_count": 0, "distinct_count": 731, "min": "2023-01-01", "max": "2024-12-31"},
+    {"column": "amount", "type": "double", "null_count": 12, "distinct_count": 45210, "min": "0.99", "max": "9999.99"},
+    {"column": "status", "type": "varchar", "null_count": 0, "distinct_count": 4, "min": "cancelled", "max": "shipped"},
+    {"column": "items", "type": "array<varchar>", "null_count": 85}
+  ],
+  "sample_rows": [{"order_id": 1, "customer_id": 1001, "order_date": "2023-01-01", "amount": 249.99, "status": "shipped", "items": ["widget-a", "widget-b"]}]
+}
+```
+
+Scalar columns (numbers, strings, dates) get `distinct_count`, `min`, and `max`. Complex columns (arrays, maps, structs) get only `null_count`.
+
+### Example: Batch Schema Lookup
+
+> What columns do the orders and customers tables have?
+
+The assistant calls `get_schema_context("mydb.orders, mydb.customers")` and gets schemas for both tables in one response — with per-table error isolation if one fails.
+
+### Example: Generate Starter Code
+
+> Generate an aggregation snippet for the orders table
+
+The assistant calls `generate_snippet("orders", "aggregate")` and returns Python code using real column names:
+
+```python
+from owlbear import AthenaClient
+import polars as pl
+
+client = AthenaClient(
+    database="your_database",
+    output_location="s3://your-bucket/results/",
+)
+
+eid = client.query("SELECT * FROM orders LIMIT 10000")
+df = client.results(eid)
+result = df.group_by("status").agg(pl.col("amount").mean())
+print(result.head())
 ```
 
 ### Environment Variables
