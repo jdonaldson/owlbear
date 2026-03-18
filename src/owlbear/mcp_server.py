@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Union
 
 from mcp.server.fastmcp import FastMCP
@@ -50,7 +51,7 @@ def _get_client() -> Union[AthenaClient, TrinoClient]:
 
 
 # ---------------------------------------------------------------------------
-# Shared helper
+# Shared helpers
 # ---------------------------------------------------------------------------
 
 
@@ -66,6 +67,23 @@ def _query_to_json(sql: str, max_rows: int) -> str:
         df = client.query(sql, max_rows=max_rows)
 
     return json.dumps(df.to_dicts(), default=str)
+
+
+_SCALAR_STAT_PATTERN = re.compile(
+    r"^("
+    r"boolean|tinyint|smallint|int(eger)?|bigint"
+    r"|float|double|real"
+    r"|varchar|char|string"
+    r"|date|timestamp"
+    r"|decimal"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _is_scalar_stat_type(data_type: str) -> bool:
+    """Return True if *data_type* supports MIN/MAX/COUNT(DISTINCT)."""
+    return _SCALAR_STAT_PATTERN.match(data_type.strip()) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -121,6 +139,277 @@ def describe_table(table: str) -> str:
         return _query_to_json(f"DESCRIBE {table}", max_rows=_MAX_ROWS_CAP)
     except Exception as e:
         return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def get_schema_context(tables: str) -> str:
+    """Batch DESCRIBE for multiple tables. Returns {table: [columns...]}.
+
+    Args:
+        tables: Comma-separated table names (e.g. ``db.t1, db.t2``).
+    """
+    table_list = [t.strip() for t in tables.split(",") if t.strip()]
+    result: dict[str, list[dict[str, str]] | str] = {}
+    for table in table_list:
+        try:
+            raw = json.loads(_query_to_json(f"DESCRIBE {table}", max_rows=_MAX_ROWS_CAP))
+            result[table] = [
+                row for row in raw if not row.get("col_name", "").startswith("#")
+            ]
+        except Exception as e:
+            result[table] = f"error: {e}"
+    return json.dumps(result, default=str)
+
+
+@mcp.tool()
+def profile_table(table: str, sample_size: int = 100) -> str:
+    """Profile a table: schema, row count, column stats, and sample rows.
+
+    Args:
+        table: Fully-qualified or short table name.
+        sample_size: Number of sample rows to return (default 100).
+    """
+    try:
+        # 1. Schema
+        describe_raw = json.loads(
+            _query_to_json(f"DESCRIBE {table}", max_rows=_MAX_ROWS_CAP)
+        )
+        columns = [
+            row for row in describe_raw if not row.get("col_name", "").startswith("#")
+        ]
+
+        # 2. Row count
+        count_raw = json.loads(_query_to_json(f"SELECT COUNT(*) AS cnt FROM {table}", max_rows=1))
+        row_count = count_raw[0]["cnt"] if count_raw else None
+
+        # 3. Column stats
+        stat_parts: list[str] = []
+        for col in columns:
+            name = col.get("col_name", col.get("column_name", ""))
+            dtype = col.get("data_type", col.get("type", ""))
+            quoted = f'"{name}"'
+            stat_parts.append(f"COUNT(CASE WHEN {quoted} IS NULL THEN 1 END) AS \"{name}__null_count\"")
+            if _is_scalar_stat_type(dtype):
+                stat_parts.append(
+                    f"COUNT(DISTINCT {quoted}) AS \"{name}__distinct_count\""
+                )
+                stat_parts.append(
+                    f"CAST(MIN({quoted}) AS VARCHAR) AS \"{name}__min\""
+                )
+                stat_parts.append(
+                    f"CAST(MAX({quoted}) AS VARCHAR) AS \"{name}__max\""
+                )
+
+        if stat_parts:
+            stats_sql = f"SELECT {', '.join(stat_parts)} FROM {table}"
+            stats_raw = json.loads(_query_to_json(stats_sql, max_rows=1))
+            stats_row = stats_raw[0] if stats_raw else {}
+        else:
+            stats_row = {}
+
+        # Reshape into per-column stats
+        column_stats: list[dict[str, object]] = []
+        for col in columns:
+            name = col.get("col_name", col.get("column_name", ""))
+            dtype = col.get("data_type", col.get("type", ""))
+            entry: dict[str, object] = {
+                "column": name,
+                "type": dtype,
+                "null_count": stats_row.get(f"{name}__null_count"),
+            }
+            if _is_scalar_stat_type(dtype):
+                entry["distinct_count"] = stats_row.get(f"{name}__distinct_count")
+                entry["min"] = stats_row.get(f"{name}__min")
+                entry["max"] = stats_row.get(f"{name}__max")
+            column_stats.append(entry)
+
+        # 4. Sample rows
+        sample_raw = json.loads(
+            _query_to_json(f"SELECT * FROM {table} LIMIT {sample_size}", max_rows=sample_size)
+        )
+
+        return json.dumps(
+            {
+                "table": table,
+                "row_count": row_count,
+                "columns": column_stats,
+                "sample_rows": sample_raw,
+            },
+            default=str,
+        )
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def generate_snippet(table: str, operation: str) -> str:
+    """Generate a Python code snippet using owlbear + Polars for a table.
+
+    Args:
+        table: Fully-qualified or short table name.
+        operation: One of ``load``, ``filter``, ``aggregate``, ``join``.
+    """
+    valid_ops = {"load", "filter", "aggregate", "join"}
+    if operation not in valid_ops:
+        return json.dumps({"error": f"Unknown operation {operation!r}. Choose from: {', '.join(sorted(valid_ops))}"})
+
+    try:
+        describe_raw = json.loads(
+            _query_to_json(f"DESCRIBE {table}", max_rows=_MAX_ROWS_CAP)
+        )
+        columns = [
+            row for row in describe_raw if not row.get("col_name", "").startswith("#")
+        ]
+
+        col_names = [c.get("col_name", c.get("column_name", "")) for c in columns]
+        col_types = [c.get("data_type", c.get("type", "")) for c in columns]
+
+        # Pick representative columns
+        numeric_col = next(
+            (n for n, t in zip(col_names, col_types) if _is_scalar_stat_type(t) and re.match(r"(int|bigint|float|double|real|decimal|smallint|tinyint)", t, re.I)),
+            col_names[0] if col_names else "col",
+        )
+        string_col = next(
+            (n for n, t in zip(col_names, col_types) if re.match(r"(varchar|char|string)", t, re.I)),
+            col_names[0] if col_names else "col",
+        )
+
+        header = (
+            "from owlbear import AthenaClient\n"
+            "import polars as pl\n\n"
+            "client = AthenaClient(\n"
+            '    database="your_database",\n'
+            '    output_location="s3://your-bucket/results/",\n'
+            ")\n\n"
+        )
+
+        if operation == "load":
+            snippet = (
+                header
+                + f'eid = client.query("SELECT * FROM {table} LIMIT 1000")\n'
+                + "df = client.results(eid)\n"
+                + "print(df.head())\n"
+            )
+        elif operation == "filter":
+            snippet = (
+                header
+                + f'eid = client.query("SELECT * FROM {table} WHERE \\"{string_col}\\\\" IS NOT NULL LIMIT 1000")\n'
+                + "df = client.results(eid)\n"
+                + f'filtered = df.filter(pl.col("{string_col}").is_not_null())\n'
+                + "print(filtered.head())\n"
+            )
+        elif operation == "aggregate":
+            snippet = (
+                header
+                + f'eid = client.query("SELECT * FROM {table} LIMIT 10000")\n'
+                + "df = client.results(eid)\n"
+                + f'result = df.group_by("{string_col}").agg(pl.col("{numeric_col}").mean())\n'
+                + "print(result.head())\n"
+            )
+        else:  # join
+            snippet = (
+                header
+                + f'eid1 = client.query("SELECT * FROM {table} LIMIT 1000")\n'
+                + "df1 = client.results(eid1)\n\n"
+                + '# Load a second table to join with\n'
+                + 'eid2 = client.query("SELECT * FROM other_table LIMIT 1000")\n'
+                + "df2 = client.results(eid2)\n\n"
+                + f'joined = df1.join(df2, on="{col_names[0] if col_names else "id"}", how="inner")\n'
+                + "print(joined.head())\n"
+            )
+
+        return json.dumps(
+            {
+                "table": table,
+                "operation": operation,
+                "columns": col_names,
+                "snippet": snippet,
+            },
+            default=str,
+        )
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+# ---------------------------------------------------------------------------
+# MCP prompts
+# ---------------------------------------------------------------------------
+
+
+@mcp.prompt()
+def explore_table(table: str) -> list[dict[str, str]]:
+    """Guided exploration of a data-lake table.
+
+    Args:
+        table: The table to explore.
+    """
+    return [
+        {
+            "role": "user",
+            "content": (
+                f"I'd like to explore the table **{table}**. Please:\n\n"
+                f"1. Run `DESCRIBE {table}` to show the schema.\n"
+                f"2. Sample a few rows with `SELECT * FROM {table} LIMIT 5`.\n"
+                "3. Suggest 3 interesting analytical queries based on the columns.\n"
+                "4. Summarize what this table appears to contain and how it could be used."
+            ),
+        }
+    ]
+
+
+@mcp.prompt()
+def build_pipeline(table: str, goal: str) -> list[dict[str, str]]:
+    """Generate a data pipeline using owlbear and Polars.
+
+    Args:
+        table: The source table.
+        goal: What the pipeline should accomplish.
+    """
+    return [
+        {
+            "role": "user",
+            "content": (
+                f"Help me build a data pipeline for **{table}** to accomplish: {goal}\n\n"
+                "Start from this boilerplate:\n\n"
+                "```python\n"
+                "from owlbear import AthenaClient\n"
+                "import polars as pl\n\n"
+                "client = AthenaClient(\n"
+                '    database="your_database",\n'
+                '    output_location="s3://your-bucket/results/",\n'
+                ")\n\n"
+                f'eid = client.query("SELECT * FROM {table} LIMIT 1000")\n'
+                "df = client.results(eid)\n"
+                "```\n\n"
+                "Adapt this code to achieve the goal. Use Polars for transformations."
+            ),
+        }
+    ]
+
+
+# ---------------------------------------------------------------------------
+# MCP resource
+# ---------------------------------------------------------------------------
+
+
+@mcp.resource("owlbear://config")
+def get_config() -> str:
+    """Expose the current owlbear backend configuration."""
+    backend = os.environ.get("OWLBEAR_BACKEND", "athena").lower()
+    config: dict[str, object] = {"backend": backend}
+
+    if backend == "athena":
+        config["database"] = os.environ.get("OWLBEAR_DATABASE", "default")
+        config["region"] = os.environ.get("AWS_REGION", "us-east-1")
+        config["s3_output_location"] = os.environ.get("OWLBEAR_S3_OUTPUT_LOCATION", "")
+    elif backend == "trino":
+        config["host"] = os.environ.get("OWLBEAR_TRINO_HOST", "")
+        config["port"] = int(os.environ.get("OWLBEAR_TRINO_PORT", "443"))
+        config["user"] = os.environ.get("OWLBEAR_TRINO_USER", "")
+        config["catalog"] = os.environ.get("OWLBEAR_TRINO_CATALOG", "")
+        config["database"] = os.environ.get("OWLBEAR_DATABASE", "")
+
+    return json.dumps(config)
 
 
 # ---------------------------------------------------------------------------
