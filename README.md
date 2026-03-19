@@ -212,7 +212,7 @@ pip install "owlbear[mcp]"
 
 | Tool | Description |
 |---|---|
-| `execute_query(sql, max_rows=500)` | Run arbitrary SQL, return JSON rows (max_rows capped at 10,000) |
+| `execute_query(sql, max_rows=500)` | Run arbitrary SQL, return JSON rows (max_rows capped at 10,000). Results with 50+ rows are auto-cached and include a `df_id` for further operations |
 | `explain_query(sql)` | Run `EXPLAIN` on a query and return the query plan |
 | `list_databases(limit=0, offset=0)` | List all available databases (paginated) |
 | `list_tables(database?, limit=0, offset=0)` | List tables in a database (paginated, defaults to configured database) |
@@ -222,6 +222,23 @@ pip install "owlbear[mcp]"
 | `profile_table(table, sample_size=100, stats_sample_pct=0)` | One-call profiling: schema, row count, column stats, sample rows. Use `stats_sample_pct` (1-100) to sample stats on large tables |
 | `generate_snippet(table, operation)` | Generate backend-aware owlbear + Polars Python code (`load`, `filter`, `aggregate`, `join`) |
 | `show_partitions(table, limit=0, offset=0)` | Show partition keys and values for a partitioned table |
+
+#### DataFrame Cache Tools
+
+Results with 50+ rows from `execute_query` are automatically cached in server memory. These tools let you explore and transform cached DataFrames without re-querying the data lake.
+
+| Tool | Description |
+|---|---|
+| `df_list()` | List cached DataFrames with shape info (rows, cols, column names) |
+| `df_drop(df_id)` | Drop a cached DataFrame to free memory |
+| `df_head(df_id, n=10)` | First N rows of a cached DataFrame as JSON |
+| `df_describe(df_id)` | Summary statistics (`df.describe()`) |
+| `df_schema(df_id)` | Column names and Polars dtypes |
+| `df_filter(df_id, column, op, value)` | Filter rows (`=`, `!=`, `>`, `<`, `>=`, `<=`, `is_null`, `is_not_null`, `contains`). Returns new cached frame |
+| `df_select(df_id, columns)` | Select/reorder columns. Returns new cached frame |
+| `df_group_by(df_id, by, agg_column, agg_func)` | Group + aggregate (`sum`, `mean`, `count`, `min`, `max`, `median`, `first`, `last`). Returns new cached frame |
+| `df_sort(df_id, by, descending=False)` | Sort rows. Returns new cached frame |
+| `df_value_counts(df_id, column)` | Frequency distribution. Returns new cached frame |
 
 ### Prompts
 
@@ -310,6 +327,34 @@ The assistant calls `search_tables("%order%")` and gets back a paginated list of
 > What partitions does the events table have?
 
 The assistant calls `show_partitions("analytics.events")` and gets back partition key/value pairs. On Athena this runs `SHOW PARTITIONS`, on Trino it queries the `$partitions` metadata table. Knowing the partition structure helps write cost-efficient queries that avoid full table scans.
+
+### Example: Iterative DataFrame Exploration
+
+> Show me all orders
+
+The assistant calls `execute_query("SELECT * FROM orders")`. Since there are 500+ rows, the result is auto-cached:
+
+```json
+{"df_id": "df_1", "rows": [...]}
+```
+
+> What does the data look like?
+
+The assistant calls `df_describe("df_1")` to get summary statistics — no re-query needed.
+
+> Filter to just shipped orders and show the top 10 by amount
+
+The assistant chains two operations:
+
+1. `df_filter("df_1", "status", "=", "shipped")` → returns `{"df_id": "df_2", "rows": [...]}`
+2. `df_sort("df_2", ["amount"], descending=True)` → returns `{"df_id": "df_3", "rows": [...]}`
+3. `df_head("df_3", n=10)` → first 10 rows
+
+> What's the average order amount by status?
+
+`df_group_by("df_1", ["status"], "amount", "mean")` → returns `{"df_id": "df_4", "rows": [...]}`
+
+Each transformation creates a new cached frame. Use `df_list()` to see all cached frames and `df_drop(df_id)` to free memory.
 
 ### Environment Variables
 

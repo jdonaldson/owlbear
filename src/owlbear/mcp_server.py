@@ -7,6 +7,7 @@ import os
 import re
 from typing import Union
 
+import polars as pl
 from mcp.server.fastmcp import FastMCP
 
 from .athena import AthenaClient
@@ -15,6 +16,7 @@ from .trino import TrinoClient
 mcp = FastMCP("owlbear")
 
 _MAX_ROWS_CAP = 10_000
+_CACHE_THRESHOLD = 50
 
 # ---------------------------------------------------------------------------
 # Client factory — lazy singleton from env vars
@@ -51,22 +53,54 @@ def _get_client() -> Union[AthenaClient, TrinoClient]:
 
 
 # ---------------------------------------------------------------------------
+# DataFrame cache
+# ---------------------------------------------------------------------------
+
+_dataframes: dict[str, pl.DataFrame] = {}
+_df_counter: int = 0
+
+
+def _next_df_id() -> str:
+    """Return the next auto-incrementing DataFrame ID."""
+    global _df_counter
+    _df_counter += 1
+    return f"df_{_df_counter}"
+
+
+def _get_df(df_id: str) -> pl.DataFrame:
+    """Retrieve a cached DataFrame by ID, raising KeyError if missing."""
+    if df_id not in _dataframes:
+        raise KeyError(f"Unknown DataFrame: {df_id}")
+    return _dataframes[df_id]
+
+
+def _cache_df(df: pl.DataFrame) -> str:
+    """Cache *df* and return its assigned ID."""
+    df_id = _next_df_id()
+    _dataframes[df_id] = df
+    return df_id
+
+
+# ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
 
 
-def _query_to_json(sql: str, max_rows: int) -> str:
-    """Run *sql* via the active backend and return JSON-serialised rows."""
+def _query_to_df(sql: str, max_rows: int) -> pl.DataFrame:
+    """Run *sql* via the active backend and return a Polars DataFrame."""
     max_rows = min(max_rows, _MAX_ROWS_CAP)
     client = _get_client()
 
     if isinstance(client, AthenaClient):
         execution_id = client.query(sql)
-        df = client.results(execution_id, max_rows=max_rows)
+        return client.results(execution_id, max_rows=max_rows)
     else:
-        df = client.query(sql, max_rows=max_rows)
+        return client.query(sql, max_rows=max_rows)
 
-    return json.dumps(df.to_dicts(), default=str)
+
+def _query_to_json(sql: str, max_rows: int) -> str:
+    """Run *sql* via the active backend and return JSON-serialised rows."""
+    return json.dumps(_query_to_df(sql, max_rows).to_dicts(), default=str)
 
 
 _SCALAR_STAT_PATTERN = re.compile(
@@ -182,7 +216,12 @@ def execute_query(sql: str, max_rows: int = 500) -> str:
         max_rows: Maximum rows to return (default 500, capped at 10 000).
     """
     try:
-        return _query_to_json(sql, max_rows)
+        df = _query_to_df(sql, max_rows)
+        rows = df.to_dicts()
+        if len(rows) >= _CACHE_THRESHOLD:
+            df_id = _cache_df(df)
+            return json.dumps({"df_id": df_id, "rows": rows}, default=str)
+        return json.dumps(rows, default=str)
     except Exception as e:
         return json.dumps({"error": str(e)})
 
@@ -490,6 +529,219 @@ def show_partitions(table: str, limit: int = 0, offset: int = 0) -> str:
         )
         return _paginate(rows, limit, offset)
     except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+# ---------------------------------------------------------------------------
+# DataFrame cache tools — housekeeping & exploration
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def df_list() -> str:
+    """List cached DataFrames with shape info (rows, cols, column names)."""
+    entries = []
+    for df_id, df in _dataframes.items():
+        entries.append({
+            "df_id": df_id,
+            "rows": df.height,
+            "cols": df.width,
+            "columns": df.columns,
+        })
+    return json.dumps(entries, default=str)
+
+
+@mcp.tool()
+def df_drop(df_id: str) -> str:
+    """Drop a cached DataFrame to free memory.
+
+    Args:
+        df_id: The DataFrame ID to drop (e.g. ``df_1``).
+    """
+    if df_id not in _dataframes:
+        return json.dumps({"error": f"Unknown DataFrame: {df_id}"})
+    del _dataframes[df_id]
+    return json.dumps({"dropped": df_id})
+
+
+@mcp.tool()
+def df_head(df_id: str, n: int = 10) -> str:
+    """Return the first N rows of a cached DataFrame as JSON.
+
+    Args:
+        df_id: The DataFrame ID (e.g. ``df_1``).
+        n: Number of rows to return (default 10).
+    """
+    try:
+        df = _get_df(df_id)
+        return json.dumps(df.head(n).to_dicts(), default=str)
+    except KeyError as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def df_describe(df_id: str) -> str:
+    """Return summary statistics (``df.describe()``) for a cached DataFrame.
+
+    Args:
+        df_id: The DataFrame ID (e.g. ``df_1``).
+    """
+    try:
+        df = _get_df(df_id)
+        return json.dumps(df.describe().to_dicts(), default=str)
+    except KeyError as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def df_schema(df_id: str) -> str:
+    """Return column names and dtypes for a cached DataFrame.
+
+    Args:
+        df_id: The DataFrame ID (e.g. ``df_1``).
+    """
+    try:
+        df = _get_df(df_id)
+        schema = [{"column": name, "dtype": str(dtype)} for name, dtype in df.schema.items()]
+        return json.dumps(schema, default=str)
+    except KeyError as e:
+        return json.dumps({"error": str(e)})
+
+
+# ---------------------------------------------------------------------------
+# DataFrame cache tools — transformations (return new cached frames)
+# ---------------------------------------------------------------------------
+
+
+_FILTER_OPS = {"=", "!=", ">", "<", ">=", "<=", "is_null", "is_not_null", "contains"}
+
+
+def _coerce_value(dtype: pl.DataType, value: str) -> object:
+    """Best-effort cast of a string *value* to match *dtype*."""
+    if dtype.is_integer():
+        return int(value)
+    if dtype.is_float():
+        return float(value)
+    if dtype == pl.Boolean:
+        return value.lower() in ("true", "1", "yes")
+    return value
+
+
+@mcp.tool()
+def df_filter(df_id: str, column: str, op: str, value: str = "") -> str:
+    """Filter rows of a cached DataFrame and cache the result.
+
+    Args:
+        df_id: Source DataFrame ID.
+        column: Column name to filter on.
+        op: Operator — one of ``=``, ``!=``, ``>``, ``<``, ``>=``, ``<=``,
+            ``is_null``, ``is_not_null``, ``contains``.
+        value: Comparison value (ignored for is_null / is_not_null).
+    """
+    if op not in _FILTER_OPS:
+        return json.dumps({"error": f"Unknown op {op!r}. Choose from: {', '.join(sorted(_FILTER_OPS))}"})
+    try:
+        df = _get_df(df_id)
+        col = pl.col(column)
+        if op == "is_null":
+            expr = col.is_null()
+        elif op == "is_not_null":
+            expr = col.is_not_null()
+        elif op == "contains":
+            expr = col.cast(pl.Utf8).str.contains(value)
+        else:
+            coerced = _coerce_value(df.schema[column], value)
+            ops = {
+                "=": col.__eq__,
+                "!=": col.__ne__,
+                ">": col.__gt__,
+                "<": col.__lt__,
+                ">=": col.__ge__,
+                "<=": col.__le__,
+            }
+            expr = ops[op](coerced)
+        result = df.filter(expr)
+        new_id = _cache_df(result)
+        return json.dumps({"df_id": new_id, "rows": result.to_dicts()}, default=str)
+    except KeyError as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def df_select(df_id: str, columns: list[str]) -> str:
+    """Select / reorder columns of a cached DataFrame and cache the result.
+
+    Args:
+        df_id: Source DataFrame ID.
+        columns: List of column names to keep.
+    """
+    try:
+        df = _get_df(df_id)
+        result = df.select(columns)
+        new_id = _cache_df(result)
+        return json.dumps({"df_id": new_id, "rows": result.to_dicts()}, default=str)
+    except KeyError as e:
+        return json.dumps({"error": str(e)})
+
+
+_AGG_FUNCS = {"sum", "mean", "count", "min", "max", "median", "first", "last"}
+
+
+@mcp.tool()
+def df_group_by(df_id: str, by: list[str], agg_column: str, agg_func: str) -> str:
+    """Group a cached DataFrame and aggregate, caching the result.
+
+    Args:
+        df_id: Source DataFrame ID.
+        by: Column(s) to group by.
+        agg_column: Column to aggregate.
+        agg_func: Aggregation function — one of ``sum``, ``mean``, ``count``,
+            ``min``, ``max``, ``median``, ``first``, ``last``.
+    """
+    if agg_func not in _AGG_FUNCS:
+        return json.dumps({"error": f"Unknown agg_func {agg_func!r}. Choose from: {', '.join(sorted(_AGG_FUNCS))}"})
+    try:
+        df = _get_df(df_id)
+        agg_expr = getattr(pl.col(agg_column), agg_func)()
+        result = df.group_by(by).agg(agg_expr).sort(by)
+        new_id = _cache_df(result)
+        return json.dumps({"df_id": new_id, "rows": result.to_dicts()}, default=str)
+    except KeyError as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def df_sort(df_id: str, by: list[str], descending: bool = False) -> str:
+    """Sort a cached DataFrame and cache the result.
+
+    Args:
+        df_id: Source DataFrame ID.
+        by: Column(s) to sort by.
+        descending: Sort descending (default False).
+    """
+    try:
+        df = _get_df(df_id)
+        result = df.sort(by, descending=descending)
+        new_id = _cache_df(result)
+        return json.dumps({"df_id": new_id, "rows": result.to_dicts()}, default=str)
+    except KeyError as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def df_value_counts(df_id: str, column: str) -> str:
+    """Frequency distribution of a column, cached as a new DataFrame.
+
+    Args:
+        df_id: Source DataFrame ID.
+        column: Column to count values for.
+    """
+    try:
+        df = _get_df(df_id)
+        result = df.get_column(column).value_counts(sort=True)
+        new_id = _cache_df(result)
+        return json.dumps({"df_id": new_id, "rows": result.to_dicts()}, default=str)
+    except KeyError as e:
         return json.dumps({"error": str(e)})
 
 

@@ -14,6 +14,8 @@ from owlbear.mcp_server import (
     _snippet_query,
     _is_scalar_stat_type,
     _MAX_ROWS_CAP,
+    _CACHE_THRESHOLD,
+    _coerce_value,
     execute_query,
     explain_query,
     list_databases,
@@ -24,6 +26,16 @@ from owlbear.mcp_server import (
     profile_table,
     generate_snippet,
     show_partitions,
+    df_list,
+    df_drop,
+    df_head,
+    df_describe,
+    df_schema,
+    df_filter,
+    df_select,
+    df_group_by,
+    df_sort,
+    df_value_counts,
     explore_table,
     build_pipeline,
     get_config,
@@ -33,10 +45,14 @@ import owlbear.mcp_server as mcp_mod
 
 @pytest.fixture(autouse=True)
 def _reset_client():
-    """Reset the lazy singleton before each test."""
+    """Reset the lazy singleton and DataFrame cache before each test."""
     mcp_mod._client = None
+    mcp_mod._dataframes.clear()
+    mcp_mod._df_counter = 0
     yield
     mcp_mod._client = None
+    mcp_mod._dataframes.clear()
+    mcp_mod._df_counter = 0
 
 
 # ---------------------------------------------------------------------------
@@ -173,24 +189,33 @@ class TestQueryToJson:
 
 
 class TestExecuteQuery:
-    def test_success(self):
-        with patch(
-            "owlbear.mcp_server._query_to_json", return_value='[{"a":1}]'
-        ) as mock_q:
-            result = execute_query("SELECT 1", max_rows=10)
-            mock_q.assert_called_once_with("SELECT 1", 10)
-            assert result == '[{"a":1}]'
+    def test_small_result_no_cache(self):
+        """Results below threshold return a plain list, no df_id."""
+        small_df = pl.DataFrame({"a": [1, 2]})
+        with patch("owlbear.mcp_server._query_to_df", return_value=small_df):
+            result = json.loads(execute_query("SELECT 1", max_rows=10))
+        assert isinstance(result, list)
+        assert result == [{"a": 1}, {"a": 2}]
+        assert len(mcp_mod._dataframes) == 0
+
+    def test_large_result_cached(self):
+        """Results at or above threshold are cached and include df_id."""
+        large_df = pl.DataFrame({"x": list(range(_CACHE_THRESHOLD))})
+        with patch("owlbear.mcp_server._query_to_df", return_value=large_df):
+            result = json.loads(execute_query("SELECT *", max_rows=500))
+        assert "df_id" in result
+        assert result["df_id"] == "df_1"
+        assert len(result["rows"]) == _CACHE_THRESHOLD
+        assert "df_1" in mcp_mod._dataframes
 
     def test_default_max_rows(self):
-        with patch(
-            "owlbear.mcp_server._query_to_json", return_value="[]"
-        ) as mock_q:
+        small_df = pl.DataFrame({"a": [1]})
+        with patch("owlbear.mcp_server._query_to_df", return_value=small_df):
             execute_query("SELECT 1")
-            mock_q.assert_called_once_with("SELECT 1", 500)
 
     def test_error_returns_json(self):
         with patch(
-            "owlbear.mcp_server._query_to_json", side_effect=RuntimeError("boom")
+            "owlbear.mcp_server._query_to_df", side_effect=RuntimeError("boom")
         ):
             result = execute_query("BAD SQL")
             parsed = json.loads(result)
@@ -680,6 +705,261 @@ class TestShowPartitions:
         ):
             result = show_partitions("bad_table")
             assert "error" in json.loads(result)
+
+
+# ---------------------------------------------------------------------------
+# DataFrame cache tools
+# ---------------------------------------------------------------------------
+
+
+def _seed_cache() -> pl.DataFrame:
+    """Seed the cache with a sample DataFrame at df_1 and return it."""
+    df = pl.DataFrame({
+        "id": [1, 2, 3, 4, 5],
+        "name": ["alice", "bob", "carol", "dave", None],
+        "score": [10.0, 20.0, 30.0, 40.0, 50.0],
+    })
+    mcp_mod._dataframes["df_1"] = df
+    mcp_mod._df_counter = 1
+    return df
+
+
+class TestDfList:
+    def test_empty(self):
+        result = json.loads(df_list())
+        assert result == []
+
+    def test_with_entries(self):
+        _seed_cache()
+        result = json.loads(df_list())
+        assert len(result) == 1
+        assert result[0]["df_id"] == "df_1"
+        assert result[0]["rows"] == 5
+        assert result[0]["cols"] == 3
+        assert "id" in result[0]["columns"]
+
+
+class TestDfDrop:
+    def test_drop_existing(self):
+        _seed_cache()
+        result = json.loads(df_drop("df_1"))
+        assert result == {"dropped": "df_1"}
+        assert "df_1" not in mcp_mod._dataframes
+
+    def test_drop_unknown(self):
+        result = json.loads(df_drop("df_999"))
+        assert "error" in result
+
+
+class TestDfHead:
+    def test_default_n(self):
+        _seed_cache()
+        result = json.loads(df_head("df_1"))
+        assert len(result) == 5  # only 5 rows total
+
+    def test_custom_n(self):
+        _seed_cache()
+        result = json.loads(df_head("df_1", n=2))
+        assert len(result) == 2
+        assert result[0]["id"] == 1
+
+    def test_unknown_df(self):
+        result = json.loads(df_head("df_999"))
+        assert "error" in result
+
+
+class TestDfDescribe:
+    def test_success(self):
+        _seed_cache()
+        result = json.loads(df_describe("df_1"))
+        assert isinstance(result, list)
+        # describe() returns stats rows (count, null_count, mean, etc.)
+        stats = {row["statistic"] for row in result}
+        assert "count" in stats
+
+    def test_unknown_df(self):
+        result = json.loads(df_describe("df_999"))
+        assert "error" in result
+
+
+class TestDfSchema:
+    def test_success(self):
+        _seed_cache()
+        result = json.loads(df_schema("df_1"))
+        assert len(result) == 3
+        names = [c["column"] for c in result]
+        assert names == ["id", "name", "score"]
+        # Check dtypes are strings
+        assert all(isinstance(c["dtype"], str) for c in result)
+
+    def test_unknown_df(self):
+        result = json.loads(df_schema("df_999"))
+        assert "error" in result
+
+
+class TestDfFilter:
+    def test_equality(self):
+        _seed_cache()
+        result = json.loads(df_filter("df_1", "id", "=", "2"))
+        assert "df_id" in result
+        assert len(result["rows"]) == 1
+        assert result["rows"][0]["id"] == 2
+
+    def test_greater_than(self):
+        _seed_cache()
+        result = json.loads(df_filter("df_1", "score", ">", "25.0"))
+        assert len(result["rows"]) == 3
+
+    def test_is_null(self):
+        _seed_cache()
+        result = json.loads(df_filter("df_1", "name", "is_null"))
+        assert len(result["rows"]) == 1
+        assert result["rows"][0]["name"] is None
+
+    def test_is_not_null(self):
+        _seed_cache()
+        result = json.loads(df_filter("df_1", "name", "is_not_null"))
+        assert len(result["rows"]) == 4
+
+    def test_contains(self):
+        _seed_cache()
+        result = json.loads(df_filter("df_1", "name", "contains", "ob"))
+        assert len(result["rows"]) == 1
+        assert result["rows"][0]["name"] == "bob"
+
+    def test_unknown_op(self):
+        _seed_cache()
+        result = json.loads(df_filter("df_1", "id", "LIKE", "1"))
+        assert "error" in result
+
+    def test_unknown_df(self):
+        result = json.loads(df_filter("df_999", "id", "=", "1"))
+        assert "error" in result
+
+    def test_caches_result(self):
+        _seed_cache()
+        result = json.loads(df_filter("df_1", "id", "=", "1"))
+        new_id = result["df_id"]
+        assert new_id in mcp_mod._dataframes
+        assert mcp_mod._dataframes[new_id].height == 1
+
+
+class TestDfSelect:
+    def test_select_columns(self):
+        _seed_cache()
+        result = json.loads(df_select("df_1", ["id", "name"]))
+        assert "df_id" in result
+        assert list(result["rows"][0].keys()) == ["id", "name"]
+
+    def test_unknown_df(self):
+        result = json.loads(df_select("df_999", ["id"]))
+        assert "error" in result
+
+
+class TestDfGroupBy:
+    def test_sum(self):
+        df = pl.DataFrame({"cat": ["a", "a", "b"], "val": [1, 2, 3]})
+        mcp_mod._dataframes["df_1"] = df
+        mcp_mod._df_counter = 1
+        result = json.loads(df_group_by("df_1", ["cat"], "val", "sum"))
+        assert "df_id" in result
+        rows = sorted(result["rows"], key=lambda r: r["cat"])
+        assert rows[0]["cat"] == "a"
+        assert rows[0]["val"] == 3
+        assert rows[1]["cat"] == "b"
+        assert rows[1]["val"] == 3
+
+    def test_count(self):
+        df = pl.DataFrame({"cat": ["a", "a", "b"], "val": [1, 2, 3]})
+        mcp_mod._dataframes["df_1"] = df
+        mcp_mod._df_counter = 1
+        result = json.loads(df_group_by("df_1", ["cat"], "val", "count"))
+        rows = sorted(result["rows"], key=lambda r: r["cat"])
+        assert rows[0]["val"] == 2  # "a" appears twice
+
+    def test_unknown_agg_func(self):
+        _seed_cache()
+        result = json.loads(df_group_by("df_1", ["name"], "score", "variance"))
+        assert "error" in result
+
+    def test_unknown_df(self):
+        result = json.loads(df_group_by("df_999", ["x"], "y", "sum"))
+        assert "error" in result
+
+
+class TestDfSort:
+    def test_ascending(self):
+        _seed_cache()
+        result = json.loads(df_sort("df_1", ["score"]))
+        assert "df_id" in result
+        scores = [r["score"] for r in result["rows"]]
+        assert scores == sorted(scores)
+
+    def test_descending(self):
+        _seed_cache()
+        result = json.loads(df_sort("df_1", ["score"], descending=True))
+        scores = [r["score"] for r in result["rows"]]
+        assert scores == sorted(scores, reverse=True)
+
+    def test_unknown_df(self):
+        result = json.loads(df_sort("df_999", ["x"]))
+        assert "error" in result
+
+
+class TestDfValueCounts:
+    def test_success(self):
+        df = pl.DataFrame({"color": ["red", "red", "blue", "red", "blue"]})
+        mcp_mod._dataframes["df_1"] = df
+        mcp_mod._df_counter = 1
+        result = json.loads(df_value_counts("df_1", "color"))
+        assert "df_id" in result
+        rows = result["rows"]
+        assert len(rows) == 2
+        # sorted by count desc
+        assert rows[0]["color"] == "red"
+        assert rows[0]["count"] == 3
+
+    def test_unknown_df(self):
+        result = json.loads(df_value_counts("df_999", "x"))
+        assert "error" in result
+
+
+class TestCoerceValue:
+    def test_integer(self):
+        assert _coerce_value(pl.Int64, "42") == 42
+
+    def test_float(self):
+        assert _coerce_value(pl.Float64, "3.14") == 3.14
+
+    def test_boolean_true(self):
+        assert _coerce_value(pl.Boolean, "true") is True
+
+    def test_boolean_false(self):
+        assert _coerce_value(pl.Boolean, "no") is False
+
+    def test_string_passthrough(self):
+        assert _coerce_value(pl.Utf8, "hello") == "hello"
+
+
+class TestAutoIncrementingIds:
+    def test_sequential_ids(self):
+        """Multiple cache operations produce sequential IDs."""
+        df1 = pl.DataFrame({"a": [1]})
+        df2 = pl.DataFrame({"b": [2]})
+        id1 = mcp_mod._cache_df(df1)
+        id2 = mcp_mod._cache_df(df2)
+        assert id1 == "df_1"
+        assert id2 == "df_2"
+
+    def test_transformation_chains(self):
+        """Transformations produce new IDs, original remains."""
+        _seed_cache()  # df_1
+        result1 = json.loads(df_filter("df_1", "id", ">", "2"))
+        result2 = json.loads(df_sort(result1["df_id"], ["id"]))
+        assert result1["df_id"] == "df_2"
+        assert result2["df_id"] == "df_3"
+        # Original still exists
+        assert "df_1" in mcp_mod._dataframes
 
 
 # ---------------------------------------------------------------------------
