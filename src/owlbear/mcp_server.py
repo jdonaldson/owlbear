@@ -15,7 +15,7 @@ from .trino import TrinoClient
 
 mcp = FastMCP("owlbear")
 
-_MAX_ROWS_CAP = 10_000
+_MAX_ROWS_CAP = int(os.environ.get("OWLBEAR_MAX_ROWS", "0"))
 _CACHE_THRESHOLD = 50
 
 # ---------------------------------------------------------------------------
@@ -88,7 +88,8 @@ def _cache_df(df: pl.DataFrame) -> str:
 
 def _query_to_df(sql: str, max_rows: int) -> pl.DataFrame:
     """Run *sql* via the active backend and return a Polars DataFrame."""
-    max_rows = min(max_rows, _MAX_ROWS_CAP)
+    if _MAX_ROWS_CAP > 0:
+        max_rows = min(max_rows, _MAX_ROWS_CAP)
     client = _get_client()
 
     if isinstance(client, AthenaClient):
@@ -214,6 +215,7 @@ def execute_query(sql: str, max_rows: int = 500) -> str:
     Args:
         sql: The SQL query to execute.
         max_rows: Maximum rows to return (default 500, capped at 10 000).
+            Set OWLBEAR_MAX_ROWS env var to override the cap (0 = no cap).
     """
     try:
         df = _query_to_df(sql, max_rows)

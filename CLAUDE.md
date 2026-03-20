@@ -30,4 +30,5 @@ Owlbear is a Python client that bridges AWS Athena and Polars. It executes Athen
 - `dist/` has build artifacts from the PyPI upload (not gitignored but also not tracked)
 - Athena `DESCRIBE` fails on partitioned tables with ragged metadata — always use `_get_columns()` (information_schema first, DESCRIBE fallback) for schema introspection
 - Release flow: bump version in pyproject.toml, commit, push, `python -m build`, `python -m twine upload dist/owlbear-X.Y.Z*`
-- MCP server (v0.7.0): 20 tools (10 data-lake + 10 DataFrame cache), 2 prompts, 1 resource — configured in `~/.mcp.json`
+- MCP server (v0.7.1): 20 tools (10 data-lake + 10 DataFrame cache), 2 prompts, 1 resource — configured in `~/.mcp.json`
+- `OWLBEAR_MAX_ROWS` env var controls max_rows cap (0 = no cap, default). Previously hardcoded at 10,000.

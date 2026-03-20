@@ -170,7 +170,8 @@ class TestQueryToJson:
         mock_trino.query.assert_called_once_with("SELECT 1", max_rows=50)
         assert json.loads(result) == [{"y": 3}]
 
-    def test_max_rows_capped(self):
+    def test_max_rows_uncapped_by_default(self):
+        """With OWLBEAR_MAX_ROWS=0 (default), max_rows passes through unchanged."""
         from owlbear.athena import AthenaClient
 
         mock_athena = MagicMock(spec=AthenaClient)
@@ -180,7 +181,21 @@ class TestQueryToJson:
         with patch("owlbear.mcp_server._get_client", return_value=mock_athena):
             _query_to_json("SELECT 1", 999_999)
 
-        mock_athena.results.assert_called_once_with("eid", max_rows=_MAX_ROWS_CAP)
+        mock_athena.results.assert_called_once_with("eid", max_rows=999_999)
+
+    def test_max_rows_capped_when_env_set(self):
+        """With OWLBEAR_MAX_ROWS set, max_rows is capped."""
+        from owlbear.athena import AthenaClient
+
+        mock_athena = MagicMock(spec=AthenaClient)
+        mock_athena.query.return_value = "eid"
+        mock_athena.results.return_value = pl.DataFrame({"x": [1]})
+
+        with patch("owlbear.mcp_server._MAX_ROWS_CAP", 5000), \
+             patch("owlbear.mcp_server._get_client", return_value=mock_athena):
+            _query_to_json("SELECT 1", 999_999)
+
+        mock_athena.results.assert_called_once_with("eid", max_rows=5000)
 
 
 # ---------------------------------------------------------------------------

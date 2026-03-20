@@ -212,7 +212,7 @@ pip install "owlbear[mcp]"
 
 | Tool | Description |
 |---|---|
-| `execute_query(sql, max_rows=500)` | Run arbitrary SQL, return JSON rows (max_rows capped at 10,000). Results with 50+ rows are auto-cached and include a `df_id` for further operations |
+| `execute_query(sql, max_rows=500)` | Run arbitrary SQL, return JSON rows. Results with 50+ rows are auto-cached and include a `df_id` for further operations. Set `OWLBEAR_MAX_ROWS` to cap results (0 = no cap, default) |
 | `explain_query(sql)` | Run `EXPLAIN` on a query and return the query plan |
 | `list_databases(limit=0, offset=0)` | List all available databases (paginated) |
 | `list_tables(database?, limit=0, offset=0)` | List tables in a database (paginated, defaults to configured database) |
@@ -369,6 +369,7 @@ Each transformation creates a new cached frame. Use `df_list()` to see all cache
 | `OWLBEAR_TRINO_PORT` | trino | Trino port | `443` |
 | `OWLBEAR_TRINO_USER` | trino | Trino user | — |
 | `OWLBEAR_TRINO_CATALOG` | trino | Trino catalog | — |
+| `OWLBEAR_MAX_ROWS` | both | Cap on `max_rows` for `execute_query` (0 = no cap) | `0` |
 
 ### Example `.mcp.json` (Athena)
 
