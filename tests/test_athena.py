@@ -1,8 +1,11 @@
 """Tests for AthenaClient"""
 
+import io
+
 import pytest
 import boto3
 import polars as pl
+import pyarrow.parquet as pq
 from unittest.mock import Mock, patch
 from botocore.config import Config
 
@@ -641,28 +644,17 @@ class TestListWorkGroups:
 # ---------------------------------------------------------------------------
 
 
-def _make_csv_bytes(df: pl.DataFrame) -> bytes:
-    """Serialize a Polars DataFrame to CSV bytes."""
-    return df.write_csv().encode("utf-8")
+def _make_parquet_bytes(df: pl.DataFrame) -> bytes:
+    """Serialize a Polars DataFrame to Parquet bytes via PyArrow."""
+    table = df.to_arrow()
+    buf = io.BytesIO()
+    pq.write_table(table, buf)
+    return buf.getvalue()
 
 
 def _sample_df() -> pl.DataFrame:
     """Return a small DataFrame for testing."""
     return pl.DataFrame({"id": [1, 2, 3], "name": ["Alice", "Bob", "Charlie"]})
-
-
-# Column metadata response for _get_column_schema (id: integer, name: varchar)
-SAMPLE_SCHEMA_RESPONSE = {
-    "ResultSet": {
-        "ResultSetMetadata": {
-            "ColumnInfo": [
-                {"Name": "id", "Type": "integer"},
-                {"Name": "name", "Type": "varchar"},
-            ]
-        },
-        "Rows": [{"Data": [{"VarCharValue": "id"}, {"VarCharValue": "name"}]}],
-    }
-}
 
 
 def _dml_query_execution(execution_id: str, output_loc: str) -> dict:
@@ -798,66 +790,53 @@ class TestWaitForCompletionCache:
 
 
 class TestResultsFromS3:
-    """Test _results_from_s3 private method"""
+    """Test _results_from_s3 private method (Parquet path)"""
 
-    def test_reads_csv_with_types(self, athena_client):
-        client, mock_athena = athena_client
-        csv_bytes = _make_csv_bytes(_sample_df())
+    def test_reads_parquet(self, athena_client):
+        client, _ = athena_client
+        parquet_bytes = _make_parquet_bytes(_sample_df())
 
-        mock_athena.get_query_results.return_value = SAMPLE_SCHEMA_RESPONSE
         mock_s3 = Mock()
         mock_s3.get_object.return_value = {
-            "Body": Mock(read=Mock(return_value=csv_bytes))
+            "Body": Mock(read=Mock(return_value=parquet_bytes))
         }
         client._s3_client = mock_s3
 
-        df = client._results_from_s3("exec-1", "s3://bucket/results/output.csv")
+        df = client._results_from_s3("s3://bucket/results/output.parquet")
 
         assert isinstance(df, pl.DataFrame)
         assert len(df) == 3
         assert df.columns == ["id", "name"]
         assert df.item(0, "id") == 1
-        assert df.dtypes[0] == pl.Int32  # typed via schema
         mock_s3.get_object.assert_called_once_with(
-            Bucket="bucket", Key="results/output.csv"
+            Bucket="bucket", Key="results/output.parquet"
         )
 
     def test_max_rows_slices(self, athena_client):
-        client, mock_athena = athena_client
-        csv_bytes = _make_csv_bytes(_sample_df())
+        client, _ = athena_client
+        parquet_bytes = _make_parquet_bytes(_sample_df())
 
-        mock_athena.get_query_results.return_value = SAMPLE_SCHEMA_RESPONSE
         mock_s3 = Mock()
         mock_s3.get_object.return_value = {
-            "Body": Mock(read=Mock(return_value=csv_bytes))
+            "Body": Mock(read=Mock(return_value=parquet_bytes))
         }
         client._s3_client = mock_s3
 
-        df = client._results_from_s3(
-            "exec-1", "s3://bucket/results/output.csv", max_rows=2
-        )
+        df = client._results_from_s3("s3://bucket/results/output.parquet", max_rows=2)
         assert len(df) == 2
 
-    def test_empty_csv(self, athena_client):
-        client, mock_athena = athena_client
+    def test_empty_parquet(self, athena_client):
+        client, _ = athena_client
         empty_df = pl.DataFrame({"id": pl.Series([], dtype=pl.Int64)})
-        csv_bytes = _make_csv_bytes(empty_df)
+        parquet_bytes = _make_parquet_bytes(empty_df)
 
-        mock_athena.get_query_results.return_value = {
-            "ResultSet": {
-                "ResultSetMetadata": {
-                    "ColumnInfo": [{"Name": "id", "Type": "integer"}]
-                },
-                "Rows": [{"Data": [{"VarCharValue": "id"}]}],
-            }
-        }
         mock_s3 = Mock()
         mock_s3.get_object.return_value = {
-            "Body": Mock(read=Mock(return_value=csv_bytes))
+            "Body": Mock(read=Mock(return_value=parquet_bytes))
         }
         client._s3_client = mock_s3
 
-        df = client._results_from_s3("exec-1", "s3://bucket/results/empty.csv")
+        df = client._results_from_s3("s3://bucket/results/empty.parquet")
         assert len(df) == 0
         assert df.columns == ["id"]
 
@@ -868,21 +847,20 @@ class TestResultsFromS3:
 
 
 class TestResultsIterFromS3:
-    """Test _results_iter_from_s3 private method"""
+    """Test _results_iter_from_s3 private method (Parquet path)"""
 
     def test_batched_reads(self, athena_client):
-        client, mock_athena = athena_client
-        csv_bytes = _make_csv_bytes(_sample_df())  # 3 rows
+        client, _ = athena_client
+        parquet_bytes = _make_parquet_bytes(_sample_df())  # 3 rows
 
-        mock_athena.get_query_results.return_value = SAMPLE_SCHEMA_RESPONSE
         mock_s3 = Mock()
         mock_s3.get_object.return_value = {
-            "Body": Mock(read=Mock(return_value=csv_bytes))
+            "Body": Mock(read=Mock(return_value=parquet_bytes))
         }
         client._s3_client = mock_s3
 
         pages = list(
-            client._results_iter_from_s3("exec-1", "s3://bucket/out.csv", page_size=2)
+            client._results_iter_from_s3("s3://bucket/out.parquet", page_size=2)
         )
 
         total_rows = sum(len(p) for p in pages)
@@ -890,24 +868,18 @@ class TestResultsIterFromS3:
         assert len(pages) == 2  # 2 + 1
         assert all(isinstance(p, pl.DataFrame) for p in pages)
 
-    def test_empty_csv_yields_nothing(self, athena_client):
-        client, mock_athena = athena_client
+    def test_empty_parquet_yields_nothing(self, athena_client):
+        client, _ = athena_client
         empty_df = pl.DataFrame({"x": pl.Series([], dtype=pl.Int64)})
-        csv_bytes = _make_csv_bytes(empty_df)
+        parquet_bytes = _make_parquet_bytes(empty_df)
 
-        mock_athena.get_query_results.return_value = {
-            "ResultSet": {
-                "ResultSetMetadata": {"ColumnInfo": [{"Name": "x", "Type": "integer"}]},
-                "Rows": [{"Data": [{"VarCharValue": "x"}]}],
-            }
-        }
         mock_s3 = Mock()
         mock_s3.get_object.return_value = {
-            "Body": Mock(read=Mock(return_value=csv_bytes))
+            "Body": Mock(read=Mock(return_value=parquet_bytes))
         }
         client._s3_client = mock_s3
 
-        pages = list(client._results_iter_from_s3("exec-1", "s3://bucket/out.csv"))
+        pages = list(client._results_iter_from_s3("s3://bucket/out.parquet"))
         assert len(pages) == 0
 
 
@@ -917,22 +889,19 @@ class TestResultsIterFromS3:
 
 
 class TestResultsS3Path:
-    """Integration tests for S3 direct-read in results()"""
+    """Integration tests for Parquet S3 direct-read in results()"""
 
-    def test_s3_read_for_dml(self, athena_client):
-        """DML queries read CSV from S3 instead of JSON API."""
+    def test_parquet_read_for_dml(self, athena_client):
+        """DML queries with .parquet output read from S3."""
         client, mock_athena = athena_client
-        csv_bytes = _make_csv_bytes(_sample_df())
+        parquet_bytes = _make_parquet_bytes(_sample_df())
 
-        qe = _dml_query_execution("exec-1", "s3://bucket/results/abc.csv")
+        qe = _dml_query_execution("exec-1", "s3://bucket/results/abc.parquet")
         client._last_query_execution = qe
-
-        # Schema lookup via get_query_results(MaxResults=1)
-        mock_athena.get_query_results.return_value = SAMPLE_SCHEMA_RESPONSE
 
         mock_s3 = Mock()
         mock_s3.get_object.return_value = {
-            "Body": Mock(read=Mock(return_value=csv_bytes))
+            "Body": Mock(read=Mock(return_value=parquet_bytes))
         }
         client._s3_client = mock_s3
 
@@ -940,16 +909,14 @@ class TestResultsS3Path:
 
         assert len(df) == 3
         assert df.columns == ["id", "name"]
-        # Only the schema lookup call — no paginated data fetch
-        mock_athena.get_query_results.assert_called_once_with(
-            QueryExecutionId="exec-1", MaxResults=1
-        )
+        # No JSON API calls at all
+        mock_athena.get_query_results.assert_not_called()
 
     def test_s3_error_falls_back(self, athena_client):
         """If S3 read fails, fall back to JSON API transparently."""
         client, mock_athena = athena_client
 
-        qe = _dml_query_execution("exec-3", "s3://bucket/results/abc.csv")
+        qe = _dml_query_execution("exec-3", "s3://bucket/results/abc.parquet")
         client._last_query_execution = qe
 
         mock_s3 = Mock()
@@ -967,21 +934,36 @@ class TestResultsS3Path:
                 ],
             }
         }
-        # First call: schema lookup (S3 path), second call: JSON API fallback
-        schema_response = {
-            "ResultSet": {
-                "ResultSetMetadata": {
-                    "ColumnInfo": [{"Name": "id", "Type": "integer"}]
-                },
-                "Rows": [{"Data": [{"VarCharValue": "id"}]}],
-            }
-        }
-        mock_athena.get_query_results.side_effect = [schema_response, json_response]
+        mock_athena.get_query_results.return_value = json_response
 
         df = client.results("exec-3")
 
         assert df.item(0, "id") == 99
-        assert mock_athena.get_query_results.call_count == 2
+        mock_athena.get_query_results.assert_called_once()
+
+    def test_csv_output_skips_s3(self, athena_client):
+        """DML with CSV output (.csv) falls through to JSON API."""
+        client, mock_athena = athena_client
+
+        qe = _dml_query_execution("exec-csv", "s3://bucket/results/abc.csv")
+        client._last_query_execution = qe
+
+        mock_athena.get_query_results.return_value = {
+            "ResultSet": {
+                "ResultSetMetadata": {
+                    "ColumnInfo": [{"Name": "col", "Type": "varchar"}]
+                },
+                "Rows": [
+                    {"Data": [{"VarCharValue": "col"}]},
+                    {"Data": [{"VarCharValue": "hello"}]},
+                ],
+            }
+        }
+
+        df = client.results("exec-csv")
+
+        assert df.item(0, "col") == "hello"
+        mock_athena.get_query_results.assert_called_once()
 
     def test_ddl_skips_s3(self, athena_client):
         """DDL statements always use JSON API."""
@@ -1010,17 +992,14 @@ class TestResultsS3Path:
     def test_fetches_query_info_when_not_cached(self, athena_client):
         """When _last_query_execution is None, fetches via get_query_info."""
         client, mock_athena = athena_client
-        csv_bytes = _make_csv_bytes(_sample_df())
+        parquet_bytes = _make_parquet_bytes(_sample_df())
 
-        qe = _dml_query_execution("exec-5", "s3://bucket/results/abc.csv")
+        qe = _dml_query_execution("exec-5", "s3://bucket/results/abc.parquet")
         mock_athena.get_query_execution.return_value = {"QueryExecution": qe}
-
-        # Schema lookup for S3 path
-        mock_athena.get_query_results.return_value = SAMPLE_SCHEMA_RESPONSE
 
         mock_s3 = Mock()
         mock_s3.get_object.return_value = {
-            "Body": Mock(read=Mock(return_value=csv_bytes))
+            "Body": Mock(read=Mock(return_value=parquet_bytes))
         }
         client._s3_client = mock_s3
 
@@ -1028,10 +1007,8 @@ class TestResultsS3Path:
 
         assert len(df) == 3
         mock_athena.get_query_execution.assert_called_once()
-        # Schema lookup only — data came from S3
-        mock_athena.get_query_results.assert_called_once_with(
-            QueryExecutionId="exec-5", MaxResults=1
-        )
+        # No JSON API calls — data came from S3 Parquet
+        mock_athena.get_query_results.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -1040,22 +1017,19 @@ class TestResultsS3Path:
 
 
 class TestResultsIterS3Path:
-    """Integration tests for S3 direct-read in results_iter()"""
+    """Integration tests for Parquet S3 direct-read in results_iter()"""
 
-    def test_s3_read_for_dml(self, athena_client):
-        """Reads CSV from S3 and yields batches."""
+    def test_parquet_read_for_dml(self, athena_client):
+        """Reads Parquet from S3 and yields batches."""
         client, mock_athena = athena_client
-        csv_bytes = _make_csv_bytes(_sample_df())
+        parquet_bytes = _make_parquet_bytes(_sample_df())
 
-        qe = _dml_query_execution("exec-1", "s3://bucket/results/abc.csv")
+        qe = _dml_query_execution("exec-1", "s3://bucket/results/abc.parquet")
         client._last_query_execution = qe
-
-        # Schema lookup via get_query_results(MaxResults=1)
-        mock_athena.get_query_results.return_value = SAMPLE_SCHEMA_RESPONSE
 
         mock_s3 = Mock()
         mock_s3.get_object.return_value = {
-            "Body": Mock(read=Mock(return_value=csv_bytes))
+            "Body": Mock(read=Mock(return_value=parquet_bytes))
         }
         client._s3_client = mock_s3
 
@@ -1063,16 +1037,14 @@ class TestResultsIterS3Path:
 
         total = sum(len(p) for p in pages)
         assert total == 3
-        # Only the schema lookup call — no paginated data fetch
-        mock_athena.get_query_results.assert_called_once_with(
-            QueryExecutionId="exec-1", MaxResults=1
-        )
+        # No JSON API calls — data came from S3 Parquet
+        mock_athena.get_query_results.assert_not_called()
 
     def test_s3_error_falls_back(self, athena_client):
         """Falls back to JSON API if S3 read fails."""
         client, mock_athena = athena_client
 
-        qe = _dml_query_execution("exec-3", "s3://bucket/results/abc.csv")
+        qe = _dml_query_execution("exec-3", "s3://bucket/results/abc.parquet")
         client._last_query_execution = qe
 
         mock_s3 = Mock()
@@ -1090,18 +1062,9 @@ class TestResultsIterS3Path:
                 ],
             }
         }
-        # First call: schema lookup (S3 path), second call: JSON API fallback
-        schema_response = {
-            "ResultSet": {
-                "ResultSetMetadata": {
-                    "ColumnInfo": [{"Name": "id", "Type": "integer"}]
-                },
-                "Rows": [{"Data": [{"VarCharValue": "id"}]}],
-            }
-        }
-        mock_athena.get_query_results.side_effect = [schema_response, json_response]
+        mock_athena.get_query_results.return_value = json_response
 
         pages = list(client.results_iter("exec-3"))
 
         assert pages[0].item(0, "id") == 7
-        assert mock_athena.get_query_results.call_count == 2
+        mock_athena.get_query_results.assert_called_once()

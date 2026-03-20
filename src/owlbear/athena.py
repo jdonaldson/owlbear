@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """AthenaClient — execute Athena SQL, get typed Polars DataFrames."""
 
+import io
+
 import boto3
 import polars as pl
 import pyarrow as pa
+import pyarrow.parquet as pq
 import time
 from typing import Iterator, Optional, Any, cast
 from botocore.config import Config
@@ -188,81 +191,42 @@ class AthenaClient:
 
         raise TimeoutError(f"Query did not complete within {max_wait_time} seconds")
 
-    def _get_column_schema(self, execution_id: str) -> pa.Schema:
-        """Fetch column metadata via a single get_query_results call."""
-        response = self.client.get_query_results(
-            QueryExecutionId=execution_id, MaxResults=1
-        )
-        column_info = response["ResultSet"]["ResultSetMetadata"]["ColumnInfo"]
-        fields = []
-        for col in column_info:
-            pa_type = presto_type_to_pyarrow(col["Type"])
-            fields.append(pa.field(col["Name"], pa_type))
-        return pa.schema(fields)
-
-    def _read_csv_from_s3(self, s3_uri: str) -> bytes:
-        """Download CSV bytes from S3."""
-        bucket, key = self._parse_s3_uri(s3_uri)
-        response = self._s3.get_object(Bucket=bucket, Key=key)
-        return response["Body"].read()
-
-    def _csv_to_dataframe(self, csv_bytes: bytes, schema: pa.Schema) -> pl.DataFrame:
-        """Read CSV bytes into a typed Polars DataFrame using a PyArrow schema."""
-        # Read all columns as strings, then cast via PyArrow for type fidelity
-        col_names = [f.name for f in schema]
-        df_raw = pl.read_csv(csv_bytes, has_header=True, infer_schema=False)
-        # Athena CSV header names should match, but use positional rename for safety
-        if df_raw.columns != col_names:
-            df_raw.columns = col_names
-        arrays = []
-        for field in schema:
-            col = df_raw.get_column(field.name)
-            try:
-                arrow_arr = pa.array(col.to_list(), type=field.type, from_pandas=True)
-            except (pa.ArrowInvalid, pa.ArrowTypeError, pa.ArrowNotImplementedError):
-                arrow_arr = pa.array(col.to_list(), type=pa.string())
-            arrays.append(arrow_arr)
-        table = pa.table(arrays, schema=schema)
-        return cast(pl.DataFrame, pl.from_arrow(table))
-
-    def _results_from_s3(
-        self, execution_id: str, s3_uri: str, max_rows: int = 0
-    ) -> pl.DataFrame:
-        """Read CSV results directly from S3 with Athena type metadata.
+    def _results_from_s3(self, s3_uri: str, max_rows: int = 0) -> pl.DataFrame:
+        """Read Parquet results directly from S3.
 
         Args:
-            execution_id: Query execution ID (for schema lookup).
-            s3_uri: Full ``s3://bucket/key`` path to the CSV file.
+            s3_uri: Full ``s3://bucket/key`` path to the Parquet file.
             max_rows: Limit rows returned (0 = all rows).
         """
-        schema = self._get_column_schema(execution_id)
-        csv_bytes = self._read_csv_from_s3(s3_uri)
-        df = self._csv_to_dataframe(csv_bytes, schema)
+        bucket, key = self._parse_s3_uri(s3_uri)
+        body = self._s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+        table = pq.read_table(io.BytesIO(body))
         if max_rows > 0:
-            df = df.head(max_rows)
-        return df
+            table = table.slice(0, max_rows)
+        return cast(pl.DataFrame, pl.from_arrow(table))
 
     def _results_iter_from_s3(
-        self, execution_id: str, s3_uri: str, page_size: int = 1000
+        self, s3_uri: str, page_size: int = 1000
     ) -> Iterator[pl.DataFrame]:
-        """Read CSV results from S3 and yield in batches.
+        """Read Parquet results from S3 and yield in batches.
 
         Args:
-            execution_id: Query execution ID (for schema lookup).
-            s3_uri: Full ``s3://bucket/key`` path to the CSV file.
+            s3_uri: Full ``s3://bucket/key`` path to the Parquet file.
             page_size: Rows per batch.
         """
-        schema = self._get_column_schema(execution_id)
-        csv_bytes = self._read_csv_from_s3(s3_uri)
-        df = self._csv_to_dataframe(csv_bytes, schema)
-        for offset in range(0, len(df), page_size):
-            yield df.slice(offset, page_size)
+        bucket, key = self._parse_s3_uri(s3_uri)
+        body = self._s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+        pf = pq.ParquetFile(io.BytesIO(body))
+        for batch in pf.iter_batches(batch_size=page_size):
+            df = cast(pl.DataFrame, pl.from_arrow(batch))
+            if len(df) > 0:
+                yield df
 
     def results(self, execution_id: str, max_rows: int = 1000) -> pl.DataFrame:
         """Get query results as a Polars DataFrame.
 
-        Tries reading the CSV result file directly from S3 first; falls back
-        to the paginated JSON API on failure.
+        Tries reading the Parquet result file directly from S3 first; falls
+        back to the paginated JSON API on failure.
         """
         # --- S3 direct-read fast path ---
         try:
@@ -271,10 +235,8 @@ class AthenaClient:
                 qe = self.get_query_info(execution_id)
             stmt_type = qe.get("StatementType", "")
             output_loc = qe.get("ResultConfiguration", {}).get("OutputLocation", "")
-            if stmt_type == "DML" and output_loc:
-                return self._results_from_s3(
-                    execution_id, output_loc, max_rows=max_rows
-                )
+            if stmt_type == "DML" and output_loc.endswith(".parquet"):
+                return self._results_from_s3(output_loc, max_rows=max_rows)
         except Exception:
             pass  # Fall through to JSON API
 
@@ -378,8 +340,8 @@ class AthenaClient:
     ) -> Iterator[pl.DataFrame]:
         """Yield query results page-by-page as Polars DataFrames.
 
-        Tries reading the CSV result file directly from S3 first; falls back
-        to the paginated JSON API on failure.
+        Tries reading the Parquet result file directly from S3 first; falls
+        back to the paginated JSON API on failure.
 
         Args:
             execution_id: The query execution ID.
@@ -395,10 +357,8 @@ class AthenaClient:
                 qe = self.get_query_info(execution_id)
             stmt_type = qe.get("StatementType", "")
             output_loc = qe.get("ResultConfiguration", {}).get("OutputLocation", "")
-            if stmt_type == "DML" and output_loc:
-                yield from self._results_iter_from_s3(
-                    execution_id, output_loc, page_size=page_size
-                )
+            if stmt_type == "DML" and output_loc.endswith(".parquet"):
+                yield from self._results_iter_from_s3(output_loc, page_size=page_size)
                 return
         except Exception:
             pass  # Fall through to JSON API
